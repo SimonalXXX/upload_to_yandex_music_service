@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import csv
 import json
-import platform
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -17,14 +17,25 @@ from urllib.parse import urlparse
 import yaml
 import yt_dlp
 from flask import Flask, Response, jsonify, request
+from yt_dlp.postprocessor.metadataparser import MetadataParserPP
 
 # ── Paths ────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 TRACKS_PATH = BASE_DIR / "tracks.csv"
 TRACKS_JSON_PATH = BASE_DIR / "tracks.json"
 ARCHIVE_PATH = BASE_DIR / "archive.txt"
 CSV_FIELDS = ["sc_id", "title", "artist", "sc_url", "status", "file", "added"]
+AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac"}
+# Незавершённые скачивания yt-dlp (после отмены/сбоя) — подчищаем.
+PARTIAL_GLOBS = ("*.part", "*.part-Frag*", "*.ytdl")
+# Некоторые заливают трек с названием «… .mp3» — без этого получаются «….mp3.mp3».
+TITLE_EXT_CLEANUP_PP = {
+    "key": "MetadataParser",
+    "when": "pre_process",
+    "actions": [(MetadataParserPP.Actions.REPLACE, "title",
+                 r"(?i)\.(?:mp3|wav|flac|m4a|aiff?|ogg|opus)$", "")],
+}
 
 app = Flask(__name__)
 
@@ -49,8 +60,10 @@ _task_lock = threading.Lock()
 # _load_tracks/_save_tracks могут брать его повторно из того же потока.
 _db_lock = threading.RLock()
 _active_task: str | None = None
+# Поток текущей задачи: пока он жив, новую задачу не запускаем — иначе
+# _cancel.clear() «оживит» недоостановленный воркер и два потока пишут в CSV.
+_worker: threading.Thread | None = None
 _cancel = threading.Event()
-_scan_result: dict | None = None
 # None = ещё не проверяли; False = браузер/профиль не найден, cookies не используем
 _browser_cookies_ok: bool | None = None
 
@@ -78,33 +91,87 @@ def _save_config(cfg: dict) -> None:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
+def _music_dir(cfg: dict | None = None) -> Path:
+    """Папка музыки. Относительный путь из конфига — от папки проекта, а не от cwd."""
+    if cfg is None:
+        cfg = _load_config()
+    p = Path(cfg.get("output", {}).get("directory", "./Music")).expanduser()
+    return (p if p.is_absolute() else BASE_DIR / p).resolve()
+
+
+def _profile_url(value: str) -> str:
+    """Имя или любая ссылка на профиль SoundCloud → URL страницы лайков."""
+    v = value.strip()
+    m = re.search(r"soundcloud\.com/([^/?#\s]+)", v)
+    user = m.group(1) if m else v.strip("/@ ")
+    return f"https://soundcloud.com/{user}/likes"
+
+
+def _abs_file(stored: str | None) -> str | None:
+    """Путь из CSV → абсолютный. В CSV храним относительно папки проекта,
+    чтобы база переживала перенос папки (старые абсолютные пути тоже читаются)."""
+    if not stored:
+        return None
+    p = Path(stored)
+    return str(p if p.is_absolute() else BASE_DIR / p)
+
+
+def _rel_file(path: str | None) -> str:
+    if not path:
+        return ""
+    p = Path(path)
+    if p.is_absolute() and p.is_relative_to(BASE_DIR):
+        return str(p.relative_to(BASE_DIR))
+    return str(p)
+
+
+def _cleanup_partials(music_dir: Path | None = None) -> None:
+    """Удаляет недокачанные файлы yt-dlp — после отмены они остаются мусором в папке.
+
+    Заодно — обложку недокачанного трека («X.m4a.part» → «X.jpg»), если готового
+    аудиофайла с тем же именем нет: обложку вшивает последний шаг, до него не дошли.
+    """
+    music_dir = music_dir or _music_dir()
+    if not music_dir.exists():
+        return
+    stems: set[str] = set()
+    for pattern in PARTIAL_GLOBS:
+        for f in music_dir.glob(pattern):
+            stems.add(Path(f.name.split(".part")[0].removesuffix(".ytdl")).stem)
+            f.unlink(missing_ok=True)
+    for stem in stems:
+        if any((music_dir / f"{stem}{ext}").exists() for ext in AUDIO_EXTS):
+            continue
+        for ext in (".jpg", ".webp", ".png"):
+            (music_dir / f"{stem}{ext}").unlink(missing_ok=True)
+
+
 # ── Tracks DB (CSV) ──────────────────────────────────────────────────────
 # Key = SoundCloud numeric ID (str).
 # Value = {title, artist, sc_url, status, file, added}
 # status: "pending" | "downloaded" | "uploaded" | "not_in_likes" (нет в текущем списке лайков SC)
 
 def _load_tracks() -> dict:
+    # Ошибку чтения не глотаем: вернуть {} значило бы, что следующий
+    # _save_tracks перезапишет всю базу одной-двумя записями.
     with _db_lock:
         if not TRACKS_PATH.exists():
             return {}
-        try:
-            result: dict = {}
-            with open(TRACKS_PATH, encoding="utf-8", newline="") as f:
-                for row in csv.DictReader(f):
-                    sc_id = row.get("sc_id", "")
-                    if not sc_id:
-                        continue
-                    result[sc_id] = {
-                        "title": row.get("title", ""),
-                        "artist": row.get("artist", ""),
-                        "sc_url": row.get("sc_url", ""),
-                        "status": row.get("status", "pending"),
-                        "file": row.get("file", "") or None,
-                        "added": row.get("added", ""),
-                    }
-            return result
-        except (IOError, csv.Error):
-            return {}
+        result: dict = {}
+        with open(TRACKS_PATH, encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                sc_id = row.get("sc_id", "")
+                if not sc_id:
+                    continue
+                result[sc_id] = {
+                    "title": row.get("title", ""),
+                    "artist": row.get("artist", ""),
+                    "sc_url": row.get("sc_url", ""),
+                    "status": row.get("status", "pending"),
+                    "file": _abs_file(row.get("file")),
+                    "added": row.get("added", ""),
+                }
+        return result
 
 
 def _save_tracks(data: dict) -> None:
@@ -115,7 +182,7 @@ def _save_tracks(data: dict) -> None:
             writer.writeheader()
             for sc_id, info in data.items():
                 row = {"sc_id": sc_id, **info}
-                row["file"] = row.get("file") or ""
+                row["file"] = _rel_file(row.get("file"))
                 writer.writerow(row)
         tmp.replace(TRACKS_PATH)
 
@@ -151,16 +218,21 @@ def _migrate_json_to_csv() -> None:
 
 
 def _cleanup_stale_paths() -> None:
-    """Clear file paths in DB that point to non-existent files."""
+    """Чинит пути к файлам в базе при старте.
+
+    Если файл не найден по сохранённому пути (например, папку проекта перенесли,
+    а в CSV остался старый абсолютный путь) — ищем его по имени в папке музыки;
+    не нашли — очищаем путь. Сохранение заодно переводит пути в относительные.
+    """
+    music_dir = _music_dir()
     with _db_lock:
         tracks = _load_tracks()
-        changed = False
         for info in tracks.values():
             fpath = info.get("file")
             if fpath and not Path(fpath).exists():
-                info["file"] = None
-                changed = True
-        if changed:
+                moved = music_dir / Path(fpath).name
+                info["file"] = str(moved) if moved.exists() else None
+        if tracks:
             _save_tracks(tracks)
 
 
@@ -217,8 +289,7 @@ def _delete_file_safe(filepath: str | None) -> None:
     p = Path(filepath)
     if p.exists():
         p.unlink(missing_ok=True)
-    cfg = _load_config()
-    music_dir = Path(cfg.get("output", {}).get("directory", "./Music")).resolve()
+    music_dir = _music_dir()
     try:
         parent = p.parent.resolve()
         # Подчищаем только пустые подпапки ВНУТРИ папки музыки — иначе при
@@ -257,13 +328,12 @@ def _music_stats() -> dict:
     downloaded = sum(1 for t in tracks.values() if t.get("status") == "downloaded")
     pending = sum(1 for t in tracks.values() if t.get("status") == "pending")
     not_in_likes = sum(1 for t in tracks.values() if t.get("status") == "not_in_likes")
-    cfg = _load_config()
-    music_dir = Path(cfg.get("output", {}).get("directory", "./Music")).resolve()
+    music_dir = _music_dir()
     size = 0
     local_files = 0
     if music_dir.exists():
         for f in music_dir.rglob("*"):
-            if f.is_file() and f.suffix in (".mp3", ".m4a", ".opus", ".flac"):
+            if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
                 size += f.stat().st_size
                 local_files += 1
     return {
@@ -293,6 +363,22 @@ def _set_task(name: str | None) -> None:
         _active_task = name
 
 
+def _start_task(name: str, target, *args) -> str | None:
+    """Запускает фоновую задачу. Возвращает текст ошибки, если что-то уже выполняется
+    (в т.ч. если прошлый воркер ещё не доостановился после «Остановить»)."""
+    global _active_task, _worker
+    with _task_lock:
+        if _active_task:
+            return f"Уже выполняется: {_active_task}"
+        if _worker is not None and _worker.is_alive():
+            return "Предыдущая задача ещё останавливается — подождите пару секунд"
+        _active_task = name
+        _cancel.clear()
+        _worker = threading.Thread(target=target, args=args, daemon=True)
+        _worker.start()
+    return None
+
+
 class _SilentLogger:
     def debug(self, msg: str) -> None: pass
     def info(self, msg: str) -> None: pass
@@ -303,7 +389,7 @@ class _SilentLogger:
 # ── Scan worker ──────────────────────────────────────────────────────────
 
 def _scan_worker(config: dict) -> None:
-    global _scan_result, _browser_cookies_ok
+    global _browser_cookies_ok
     try:
         sc = config.get("soundcloud", {})
         target_url = sc.get("profile_url", "")
@@ -357,6 +443,14 @@ def _scan_worker(config: dict) -> None:
                 _broadcast({"type": "error", "message": f"Ошибка сканирования: {e!s:.200}"})
                 return
 
+        if not entries:
+            # Пустой ответ без исключения (сбой SoundCloud, опечатка в имени) не должен
+            # переводить все ожидающие треки в «пропал из лайков».
+            _broadcast({"type": "error", "message":
+                        "SoundCloud вернул пустой список лайков — статусы не изменены. "
+                        "Проверьте имя пользователя и повторите."})
+            return
+
         with _db_lock:
             tracks = _load_tracks()
             new_entries: list[dict] = []
@@ -365,43 +459,38 @@ def _scan_worker(config: dict) -> None:
                 sc_id = str(e.get("id", ""))
                 if not sc_id:
                     continue
-                if sc_id in tracks and tracks[sc_id].get("status") in ("downloaded", "uploaded"):
-                    if not tracks[sc_id].get("title"):
-                        tracks[sc_id].update(
-                            title=e.get("title", ""),
-                            artist=e.get("uploader", ""),
-                            sc_url=e.get("url", "") or e.get("webpage_url", ""),
+                prev = tracks.get(sc_id)
+                sc_url = e.get("url") or e.get("webpage_url") or (prev or {}).get("sc_url", "")
+                if prev and prev.get("status") in ("downloaded", "uploaded"):
+                    if not prev.get("title"):
+                        prev.update(
+                            title=e.get("title") or "",
+                            artist=e.get("uploader") or prev.get("artist", ""),
+                            sc_url=sc_url,
                         )
                 else:
                     new_entries.append(e)
-                    prev = tracks.get(sc_id)
                     if prev is None:
                         first_seen_count += 1
+                    # Плоский скан не отдаёт исполнителя — не затираем уже известного.
                     tracks[sc_id] = {
-                        "title": e.get("title", ""),
-                        "artist": e.get("uploader", ""),
-                        "sc_url": e.get("url", "") or e.get("webpage_url", ""),
+                        "title": e.get("title") or (prev or {}).get("title", ""),
+                        "artist": e.get("uploader") or (prev or {}).get("artist", ""),
+                        "sc_url": sc_url,
                         "status": "pending",
-                        "file": None,
+                        "file": (prev or {}).get("file"),
                         "added": (prev or {}).get("added") or time.strftime("%Y-%m-%d"),
                     }
-            seen_ids = {str(e.get("id", "")) for e in entries if e}
             not_in_likes_n = 0
-            for sid, info in tracks.items():
-                if info.get("status") == "pending" and sid not in seen_ids and not info.get("file"):
-                    info["status"] = "not_in_likes"
-                    not_in_likes_n += 1
+            # С лимитом max_tracks список неполный — «пропавшие» за лимитом не пропали.
+            if not (max_tracks and max_tracks > 0):
+                seen_ids = {str(e.get("id", "")) for e in entries}
+                for sid, info in tracks.items():
+                    if info.get("status") == "pending" and sid not in seen_ids and not info.get("file"):
+                        info["status"] = "not_in_likes"
+                        not_in_likes_n += 1
 
             _save_tracks(tracks)
-
-        _scan_result = {
-            "entries": entries,
-            "new_entries": new_entries,
-            "total": len(entries),
-            "new_count": first_seen_count,
-            "already": len(entries) - len(new_entries),
-            "not_in_likes": not_in_likes_n,
-        }
 
         all_display = []
         for e in entries:
@@ -411,8 +500,8 @@ def _scan_worker(config: dict) -> None:
             info = tracks.get(sc_id, {})
             all_display.append({
                 "id": sc_id,
-                "title": e.get("title", ""),
-                "artist": info.get("artist") or e.get("uploader", ""),
+                "title": info.get("title") or e.get("title") or sc_id,
+                "artist": info.get("artist") or e.get("uploader") or "",
                 "status": info.get("status", "pending"),
             })
         # Треки из базы, которых уже нет в лайках (в т.ч. загруженные в ЯМ),
@@ -445,35 +534,41 @@ def _scan_worker(config: dict) -> None:
 # ── Pipeline worker: download → upload ───────────────────────────────────
 
 def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | None = None) -> None:
-    global _browser_cookies_ok
-    try:
-        scan = _scan_result
-        if not scan or not scan.get("entries"):
-            _broadcast({"type": "error", "message": "Нет данных скана — сначала проверьте треки"})
-            return
+    """Скачивает треки из локальной базы (tracks.csv) и, если нужно, грузит в ЯМ.
 
+    Работает по базе, а не по результату последнего скана: после перезапуска
+    приложения скачивание доступно сразу. track_ids=None — все «pending».
+    """
+    global _browser_cookies_ok
+    ydl = None
+    try:
         sc = config.get("soundcloud", {})
         out = config.get("output", {})
 
-        output_dir = Path(out.get("directory", "./Music")).resolve()
+        output_dir = _music_dir(config)
         output_dir.mkdir(parents=True, exist_ok=True)
         audio_fmt = out.get("format", "mp3")
         quality = out.get("quality", "320")
         template = str(output_dir / "%(uploader)s - %(title)s.%(ext)s")
 
-        if track_ids is not None:
-            selected = [str(tid) for tid in track_ids]
-            entries_by_id = {str(e.get("id", "")): e for e in scan["entries"] if e and e.get("id")}
-            new_entries = [entries_by_id[tid] for tid in selected if tid in entries_by_id]
+        existing_tracks = _load_tracks()
+        if track_ids is None:
+            selected = [sid for sid, t in existing_tracks.items() if t.get("status") == "pending"]
         else:
-            new_entries = scan["new_entries"]
-        if not new_entries:
+            selected = [str(tid) for tid in track_ids]
+        unknown = [sid for sid in selected if sid not in existing_tracks]
+        if unknown:
+            _broadcast({"type": "log", "level": "warn",
+                        "message": f"Нет в базе, пропущено: {len(unknown)} — обновите список лайков"})
+        selected = [sid for sid in selected if sid in existing_tracks]
+        if not selected:
             _broadcast({"type": "error", "message": "Нет выбранных треков"})
             return
-        total = len(new_entries)
-        downloaded: list[str] = []
-        errors: list[str] = []
+
+        total = len(selected)
+        processed = 0
         saved_count = 0
+        errors: list[str] = []
         download_failures: list[str] = []
         last_filepath: list[str | None] = [None]
         last_meta: list[dict] = [{}]
@@ -485,44 +580,44 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
 
         last_emit = [0.0]
 
+        def _short(s: str) -> str:
+            return (s[:55] + "…") if len(s) > 55 else s
+
         def _hook(d: dict) -> None:
+            # Именно DownloadCancelled: обычный DownloadError загрузчик HLS-фрагментов
+            # глотает как сбой одного куска и идёт дальше — отмена не срабатывала.
             if _cancel.is_set():
-                raise yt_dlp.utils.DownloadError("Отменено")
+                raise yt_dlp.utils.DownloadCancelled("Отменено")
             status = d.get("status")
             if status == "downloading":
                 now = time.monotonic()
                 if now - last_emit[0] < 0.3:
                     return  # не заливаем SSE событием на каждый чанк
                 last_emit[0] = now
-                title = Path(d.get("filename", "")).stem
-                _broadcast({
-                    "type": "downloading",
-                    "id": current_id[0],
-                    "title": (title[:55] + "…") if len(title) > 55 else title,
-                    "downloaded": len(downloaded),
-                    "saved": saved_count,
-                    "total": total,
-                })
-            elif status == "finished":
-                title = Path(d.get("filename", "")).stem
-                downloaded.append(title)
-                _broadcast({
-                    "type": "track_done",
-                    "id": current_id[0],
-                    "title": (title[:55] + "…") if len(title) > 55 else title,
-                    "downloaded": len(downloaded),
-                    "saved": saved_count,
-                    "total": total,
-                })
+            elif status != "finished":
+                return
+            # «finished» — скачан исходник, дальше ffmpeg; трек ещё НЕ готов,
+            # поэтому это тоже downloading (со stage=convert), а не track_done.
+            _broadcast({
+                "type": "downloading",
+                "id": current_id[0],
+                "title": _short(Path(d.get("filename", "")).stem),
+                "stage": "convert" if status == "finished" else "download",
+                "downloaded": processed,
+                "saved": saved_count,
+                "total": total,
+            })
 
         def _pp_hook(d: dict) -> None:
+            if d.get("status") == "started" and _cancel.is_set():
+                raise yt_dlp.utils.DownloadCancelled("Отменено")  # не начинаем следующий шаг ffmpeg
             if d.get("status") == "finished":
                 info = d.get("info_dict", {})
                 last_filepath[0] = info.get("filepath") or info.get("filename")
                 last_meta[0] = {"uploader": info.get("uploader", ""), "title": info.get("title", "")}
 
         class _Logger:
-            _IGNORED = ("Deprecated Feature:", "Support for Python version")
+            _IGNORED = ("Deprecated Feature:",)
 
             def debug(self, msg: str) -> None: pass
             def info(self, msg: str) -> None: pass
@@ -542,16 +637,13 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
             "sleep_requests": sc.get("sleep_requests", 1.5),
             "download_archive": str(ARCHIVE_PATH),
             "postprocessors": [
+                TITLE_EXT_CLEANUP_PP,
                 {"key": "FFmpegExtractAudio", "preferredcodec": audio_fmt, "preferredquality": quality},
                 {"key": "FFmpegMetadata"},
                 {"key": "EmbedThumbnail"},
             ],
             "writethumbnail": True,
             "embedthumbnail": True,
-            "parse_metadata": [
-                "%(uploader)s:%(meta_artist)s",
-                "%(title)s:%(meta_title)s",
-            ],
             "progress_hooks": [_hook],
             "postprocessor_hooks": [_pp_hook],
             "logger": _Logger(),
@@ -560,98 +652,103 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
         if cookies_browser and _browser_cookies_ok is not False:
             dl_opts["cookiesfrombrowser"] = (cookies_browser,)
 
-        existing_tracks = _load_tracks()
+        def _fail(sc_id: str, message: str, title: str) -> None:
+            download_failures.append(title)
+            _broadcast({"type": "log", "id": sc_id, "level": "error", "message": message})
 
-        with yt_dlp.YoutubeDL(dl_opts) as ydl:
-            for entry in new_entries:
+        def _done(sc_id: str, title: str, status: str) -> None:
+            _broadcast({
+                "type": "track_done",
+                "id": sc_id,
+                "title": _short(title),
+                "status": status,
+                "downloaded": processed,
+                "saved": saved_count,
+                "total": total,
+            })
+
+        ydl = yt_dlp.YoutubeDL(dl_opts)
+        for sc_id in selected:
+            if _cancel.is_set():
+                break
+            entry = existing_tracks[sc_id]
+            title_hint = (entry.get("title") or sc_id)[:80]
+            prev_status = entry.get("status")
+            # Перекачка уже отправленного в ЯМ трека не должна сбрасывать «uploaded».
+            new_status = "uploaded" if prev_status == "uploaded" else "downloaded"
+            current_id[0] = sc_id
+
+            existing_file = entry.get("file")
+            if existing_file and Path(existing_file).exists():
+                processed += 1
+                saved_count += 1
+                if prev_status != new_status:
+                    _track_update(sc_id, status=new_status)
+                _done(sc_id, title_hint, new_status)
+                continue
+
+            # Файла нет (например, удалён после загрузки в ЯМ), но id мог
+            # остаться в archive.txt — уберём, иначе yt-dlp молча пропустит
+            # трек, а UI покажет «Файл не появился после скачивания».
+            _remove_from_archive(sc_id)
+
+            url = entry.get("sc_url", "")
+            if not url:
+                processed += 1
+                _fail(sc_id, f"Нет URL для трека: {title_hint}", title_hint)
+                continue
+            last_filepath[0] = None
+            last_meta[0] = {}
+            errors_before = len(errors)
+            dl_err: str | None = None
+            try:
+                ydl.download([url])
+            except Exception as e:
                 if _cancel.is_set():
-                    break
-                sc_id = str(entry.get("id", ""))
-                title_hint = (entry.get("title") or sc_id or "?")[:80]
-                current_id[0] = sc_id
-
-                existing_file = existing_tracks.get(sc_id, {}).get("file")
-                if existing_file and Path(existing_file).exists():
-                    downloaded.append(title_hint)
-                    saved_count += 1
-                    _broadcast({
-                        "type": "track_done",
-                        "id": sc_id,
-                        "title": (title_hint[:55] + "…") if len(title_hint) > 55 else title_hint,
-                        "downloaded": len(downloaded),
-                        "saved": saved_count,
-                        "total": total,
-                    })
-                    continue
-
-                # Файла нет (например, удалён после загрузки в ЯМ), но id мог
-                # остаться в archive.txt — уберём, иначе yt-dlp молча пропустит
-                # трек, а UI покажет «Файл не появился после скачивания».
-                _remove_from_archive(sc_id)
-
-                url = entry.get("url") or entry.get("webpage_url", "")
-                if not url:
-                    download_failures.append(title_hint)
-                    _broadcast({
-                        "type": "log",
-                        "id": sc_id,
-                        "level": "error",
-                        "message": f"Нет URL для трека: {title_hint}",
-                    })
-                    continue
-                last_filepath[0] = None
-                last_meta[0] = {}
-                dl_err: str | None = None
-                try:
-                    ydl.download([url])
-                except Exception as e:
-                    if _cancel.is_set():
-                        break  # отмена — не считаем её ошибкой скачивания
-                    if _is_cookie_db_error(str(e)) and "cookiesfrombrowser" in dl_opts:
-                        # Браузер не найден — пересоздаём загрузчик без cookies
-                        # и повторяем этот же трек.
-                        _browser_cookies_ok = False
-                        dl_opts.pop("cookiesfrombrowser", None)
-                        ydl = yt_dlp.YoutubeDL(dl_opts)
-                        _broadcast({"type": "log", "level": "warn", "message":
-                                    "Cookies браузера недоступны — скачиваю без них"})
-                        try:
-                            ydl.download([url])
-                        except Exception as e2:
-                            dl_err = str(e2)[:280]
-                    else:
-                        dl_err = str(e)[:280]
-                    if dl_err is not None:
-                        download_failures.append(title_hint)
-                        _broadcast({
-                            "type": "log",
-                            "id": sc_id,
-                            "level": "error",
-                            "message": f"Ошибка скачивания ({title_hint}): {dl_err}",
-                        })
-                fpath = last_filepath[0]
-                meta = last_meta[0]
-                if fpath and Path(fpath).exists():
-                    # Перекачка уже отправленного в ЯМ трека не должна
-                    # сбрасывать статус «uploaded» на «downloaded».
-                    prev_status = existing_tracks.get(sc_id, {}).get("status")
-                    _track_update(
-                        sc_id,
-                        status="uploaded" if prev_status == "uploaded" else "downloaded",
-                        title=meta.get("title") or entry.get("title", ""),
-                        artist=meta.get("uploader") or entry.get("uploader", ""),
-                        sc_url=url,
-                        file=str(Path(fpath).resolve()),
-                    )
-                    saved_count += 1
-                elif dl_err is None:
-                    download_failures.append(title_hint)
-                    _broadcast({
-                        "type": "log",
-                        "id": sc_id,
-                        "level": "error",
-                        "message": f"Файл не появился после скачивания: {title_hint}",
-                    })
+                    break  # отмена — не считаем её ошибкой скачивания
+                if _is_cookie_db_error(str(e)) and "cookiesfrombrowser" in dl_opts:
+                    # Браузер не найден — пересоздаём загрузчик без cookies
+                    # и повторяем этот же трек.
+                    _browser_cookies_ok = False
+                    dl_opts.pop("cookiesfrombrowser", None)
+                    ydl.close()
+                    ydl = yt_dlp.YoutubeDL(dl_opts)
+                    _broadcast({"type": "log", "level": "warn", "message":
+                                "Cookies браузера недоступны — скачиваю без них"})
+                    try:
+                        ydl.download([url])
+                    except Exception as e2:
+                        dl_err = str(e2)[:280]
+                else:
+                    dl_err = str(e)[:280]
+            if _cancel.is_set():
+                break
+            processed += 1
+            fpath = last_filepath[0]
+            meta = last_meta[0]
+            if fpath and Path(fpath).exists():
+                title = meta.get("title") or entry.get("title", "")
+                _track_update(
+                    sc_id,
+                    status=new_status,
+                    title=title,
+                    artist=meta.get("uploader") or entry.get("artist", ""),
+                    sc_url=url,
+                    file=str(Path(fpath).resolve()),
+                )
+                saved_count += 1
+                _done(sc_id, title or title_hint, new_status)
+            else:
+                reason = dl_err or next(iter(errors[errors_before:][-1:]), "")
+                if "DRM protected" in reason:
+                    _fail(sc_id, f"{title_hint}: трек защищён DRM (SoundCloud Go+) — "
+                                 "скачать нельзя", title_hint)
+                elif dl_err is not None:
+                    _fail(sc_id, f"Ошибка скачивания ({title_hint}): {dl_err}", title_hint)
+                else:
+                    detail = f": {reason[:200]}" if reason else ""
+                    _fail(sc_id, f"Файл не появился после скачивания ({title_hint}){detail}",
+                          title_hint)
 
         if _cancel.is_set():
             _broadcast({"type": "cancelled", "downloaded": saved_count})
@@ -665,7 +762,7 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
         })
 
         if do_upload:
-            _upload_phase(config, saved_count, track_ids=[str(e.get("id", "")) for e in new_entries])
+            _upload_phase(config, saved_count, track_ids=selected)
         else:
             _broadcast({
                 "type": "all_done",
@@ -677,6 +774,12 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
     except Exception as e:
         _broadcast({"type": "error", "message": str(e)[:300]})
     finally:
+        if ydl is not None:
+            ydl.close()
+        try:
+            _cleanup_partials()
+        except OSError:
+            pass
         _set_task(None)
 
 
@@ -691,7 +794,7 @@ def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None
     ym = config.get("yandex_music", {})
     playlist_url = ym.get("playlist_url", "")
     if not playlist_url:
-        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0,
+        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "warn",
                      "message": "URL плейлиста ЯМ не задан — загрузка пропущена."})
         return
 
@@ -706,7 +809,7 @@ def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None
             get_playlist_tracks,
         )
     except ImportError:
-        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0,
+        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "error",
                      "message": "Модуль ym_uploader не найден"})
         return
 
@@ -724,7 +827,7 @@ def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None
         ]
 
     if not to_upload:
-        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0,
+        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "warn",
                      "message": "Нет треков для загрузки в ЯМ"})
         return
 
@@ -734,18 +837,18 @@ def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None
         session = _create_session()
         auth = _get_auth(session)
         if not auth.get("logged"):
-            _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0,
+            _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "error",
                          "message": auth.get("error", "Не авторизованы в ЯМ")})
             return
         token = auth["token"]
         uid = auth["uid"]
         kind = _resolve_playlist_kind(session, playlist_url, token, uid)
         if not kind:
-            _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0,
+            _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "error",
                          "message": "Не удалось определить плейлист"})
             return
     except Exception as e:
-        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0,
+        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "error",
                      "message": str(e)[:200]})
         return
 
@@ -778,7 +881,9 @@ def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None
                     _broadcast({"type": "log", "id": sc_id, "level": "warn",
                                  "message": f"{name}: файл принят, ЯМ ещё обрабатывает — "
                                             "проверю плейлист после загрузки"})
-                # При неподтверждённой загрузке файл не удаляем — вдруг не доехал.
+                # Удаляем только при точном подтверждении по id трека: «grown» (плейлист
+                # вырос — мог вырасти и за счёт прошлого дообработанного трека) и
+                # «accepted» не гарантируют, что доехал именно этот файл.
                 if del_after and res is True:
                     _delete_file_safe(str(filepath.resolve()))
                     _track_update(sc_id, file="")
@@ -912,78 +1017,59 @@ def api_status():
 def api_save():
     data = request.get_json(silent=True) or {}
     cfg = _load_config()
-    username = data.get("username", "").strip()
+    username = (data.get("username") or "").strip()
     if username:
-        if "soundcloud.com" in username:
-            url = username.rstrip("/")
-            if not url.endswith("/likes"):
-                url += "/likes"
-            cfg.setdefault("soundcloud", {})["profile_url"] = url
-        else:
-            cfg.setdefault("soundcloud", {})["profile_url"] = f"https://soundcloud.com/{username}/likes"
+        cfg.setdefault("soundcloud", {})["profile_url"] = _profile_url(username)
     playlist_url = data.get("playlist_url")
     if playlist_url is not None:
-        cfg.setdefault("yandex_music", {})["playlist_url"] = playlist_url.strip()
+        cfg.setdefault("yandex_music", {})["playlist_url"] = str(playlist_url).strip()
     _save_config(cfg)
+    return jsonify({"ok": True})
+
+
+def _started(err: str | None):
+    if err:
+        return jsonify({"error": err}), 409
     return jsonify({"ok": True})
 
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    global _active_task
-    with _task_lock:
-        if _active_task:
-            return jsonify({"error": f"Уже выполняется: {_active_task}"}), 409
-        _active_task = "scan"
-    _cancel.clear()
-    cfg = _load_config()
-    threading.Thread(target=_scan_worker, args=(cfg,), daemon=True).start()
-    return jsonify({"ok": True})
+    return _started(_start_task("scan", _scan_worker, _load_config()))
 
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
-    global _active_task
     data = request.get_json(silent=True) or {}
-    do_upload = data.get("upload", True)
+    do_upload = bool(data.get("upload", True))
     track_ids = data.get("track_ids")
-    with _task_lock:
-        if _active_task:
-            return jsonify({"error": f"Уже выполняется: {_active_task}"}), 409
-        if not _scan_result or not _scan_result.get("entries"):
-            return jsonify({"error": "Сначала проверьте треки"}), 400
-        _active_task = "pipeline"
-    _cancel.clear()
-    cfg = _load_config()
-    threading.Thread(target=_pipeline_worker, args=(cfg, do_upload, track_ids), daemon=True).start()
-    return jsonify({"ok": True})
+    if track_ids is not None and not isinstance(track_ids, list):
+        return jsonify({"error": "track_ids должен быть списком"}), 400
+    return _started(_start_task("pipeline", _pipeline_worker, _load_config(), do_upload, track_ids))
 
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    global _active_task
-    with _task_lock:
-        if _active_task:
-            return jsonify({"error": f"Уже выполняется: {_active_task}"}), 409
-        _active_task = "upload"
-    _cancel.clear()
-    cfg = _load_config()
-    threading.Thread(target=_upload_only_worker, args=(cfg,), daemon=True).start()
-    return jsonify({"ok": True})
+    return _started(_start_task("upload", _upload_only_worker, _load_config()))
 
 
 @app.route("/api/cancel", methods=["POST"])
 def api_cancel():
-    """Только сигнал отмены — сброс active_task делает воркер в finally или /api/force-clear."""
+    """Только сигнал отмены — active_task сбрасывает сам воркер в finally."""
     _cancel.set()
     return jsonify({"ok": True})
 
 
 @app.route("/api/force-clear", methods=["POST"])
 def api_force_clear():
+    """Аварийный сброс «зависшего» active_task. Пока поток задачи жив — отказываем:
+    иначе следующая задача стартует параллельно ещё работающему воркеру."""
     global _active_task
     _cancel.set()
     with _task_lock:
+        if _worker is not None and _worker.is_alive():
+            return jsonify({"ok": False, "alive": True,
+                            "error": "Задача ещё останавливается"}), 409
         old = _active_task
         _active_task = None
     return jsonify({"ok": True, "cleared": old})
@@ -1011,17 +1097,10 @@ def api_mark_uploaded():
 
 @app.route("/api/open-folder", methods=["POST"])
 def api_open_folder():
-    cfg = _load_config()
-    music_dir = Path(cfg.get("output", {}).get("directory", "./Music")).resolve()
+    music_dir = _music_dir()
     music_dir.mkdir(parents=True, exist_ok=True)
-    system = platform.system()
     try:
-        if system == "Darwin":
-            subprocess.Popen(["open", str(music_dir)])
-        elif system == "Windows":
-            subprocess.Popen(["explorer", str(music_dir)])
-        else:
-            subprocess.Popen(["xdg-open", str(music_dir)])
+        subprocess.Popen(["open", str(music_dir)])
     except Exception as e:
         return jsonify({"error": str(e)[:200]}), 500
     return jsonify({"ok": True})
@@ -1126,6 +1205,9 @@ def api_check_playlist():
 @app.route("/api/progress")
 def api_progress():
     q: queue.Queue = queue.Queue(maxsize=256)
+    # Первое событие — текущее состояние: после сна/обрыва связи клиент
+    # переподключается и может понять, что задача уже закончилась.
+    q.put_nowait(json.dumps({"type": "hello", "active_task": _active_task}))
     with _clients_lock:
         _clients.append(q)
 
@@ -1171,7 +1253,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   --radius:12px;--radius-sm:8px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
   background:var(--bg);color:var(--text);height:100vh;line-height:1.5;overflow:hidden}
 ::selection{background:var(--primary-glow)}
 
@@ -1511,6 +1593,14 @@ async function loadTracks(){
   }catch(e){console.error(e)}
 }
 
+async function loadTracksFresh(){
+  // Перечитать базу после пропущенных событий (обрыв SSE) — статусы могли измениться.
+  try{
+    const d=await (await fetch('/api/tracks')).json();
+    if(d.tracks){allTracks=d.tracks;liveStatus.clear();render()}
+  }catch(e){console.error(e)}
+}
+
 async function loadStatus(){
   try{
     const r=await fetch('/api/status'),d=await r.json();
@@ -1670,7 +1760,7 @@ function render(){
 }
 
 function escapeHtml(s){
-  return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function renderSelbar(){
@@ -1803,7 +1893,7 @@ function handleEvent(d){
       if(d.id){
         liveStatus.delete(d.id);
         const t=allTracks.find(x=>x.id===d.id);
-        if(t) t.status='downloaded';
+        if(t) t.status=d.status||'downloaded';
         updatePill(d.id);
       }
       log('✓ '+d.title,'ok');
@@ -1831,7 +1921,7 @@ function handleEvent(d){
         const t=allTracks.find(x=>x.id===d.id);
         if(t) t.status='uploaded';
         checked.delete(d.id);
-        updatePill(d.id);renderSelbar();
+        render();
       }
       break;
 
@@ -1843,9 +1933,11 @@ function handleEvent(d){
       if(d.failures) t+=(t?' · ':'')+'Ошибок скачивания: '+d.failures;
       if(d.uploaded>0) t+=(t?' · ':'')+'В ЯМ: '+d.uploaded;
       if(d.upload_errors) t+=(t?' · ':'')+'Ошибок загрузки: '+d.upload_errors;
-      if(d.message) t+=(t?'\n':'')+d.message;
-      $('banner-ok').textContent=t||'Готово';
-      $('banner-ok').classList.add('on');
+      if(d.message) t+=(t?' · ':'')+d.message;
+      const bad=d.level==='error'||d.level==='warn';
+      if(d.level==='error') log(d.message,'err');
+      $(bad?'banner-cancel':'banner-ok').textContent=t||'Готово';
+      $(bad?'banner-cancel':'banner-ok').classList.add('on');
       setBusy(false);loadStatus();
       break;
     }
@@ -1865,6 +1957,11 @@ function handleEvent(d){
     case 'error':
       log(d.message,'err');
       toast(d.message.length>60?d.message.slice(0,60)+'…':d.message);
+      hideActivity();setBusy(false);loadStatus();
+      break;
+    case 'hello':
+      // (Пере)подключение к SSE: если задача уже закончилась, пока связи не было, — снимаем «занято».
+      if(!d.active_task && busy){hideActivity();setBusy(false);loadStatus();loadTracksFresh()}
       break;
     case 'log':
       log(d.message,d.level==='error'?'err':'');
@@ -1925,17 +2022,18 @@ async function doStart(upload){
 
 async function doCancel(){
   try{await fetch('/api/cancel',{method:'POST'})}catch(e){}
-  $('act-cur').textContent='Останавливаем…';
-  setTimeout(async()=>{
+  $('act-cur').textContent='Останавливаем… (дожидаюсь конца текущего трека)';
+  let tries=0;
+  const poll=async()=>{
     try{
-      const r=await fetch('/api/status'),d=await r.json();
-      if(d.active_task){
-        await fetch('/api/force-clear',{method:'POST'});
-        setBusy(false);hideActivity();
-        toast('Задача принудительно остановлена');loadStatus();
-      }
+      const d=await (await fetch('/api/status')).json();
+      if(!d.active_task){if(busy){hideActivity();setBusy(false);loadStatus()}return}
+      // Сервер откажет (409), пока поток задачи жив, — это нормально, ждём дальше.
+      if(++tries%5===0) await fetch('/api/force-clear',{method:'POST'});
     }catch(e){}
-  },6000);
+    setTimeout(poll,2000);
+  };
+  setTimeout(poll,2000);
 }
 
 async function doUpload(){
@@ -1979,6 +2077,7 @@ render();
 if __name__ == "__main__":
     _migrate_json_to_csv()
     _cleanup_stale_paths()
+    _cleanup_partials()
     port = 5555
     threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
