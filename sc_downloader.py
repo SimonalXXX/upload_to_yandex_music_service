@@ -13,6 +13,7 @@ from typing import Optional
 import schedule
 import yaml
 import yt_dlp
+from yt_dlp.postprocessor.metadataparser import MetadataParserPP
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
@@ -27,8 +28,16 @@ from rich.table import Table
 
 console = Console()
 
-DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
-DEFAULT_ARCHIVE_PATH = Path(__file__).parent / "archive.txt"
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = BASE_DIR / "config.yaml"
+DEFAULT_ARCHIVE_PATH = BASE_DIR / "archive.txt"
+AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac"}
+
+
+def music_dir(config: dict) -> Path:
+    """Папка музыки. Относительный путь из конфига — от папки проекта, а не от cwd."""
+    p = Path(config.get("output", {}).get("directory", "./Music")).expanduser()
+    return (p if p.is_absolute() else BASE_DIR / p).resolve()
 
 
 def load_config(path: Path) -> dict:
@@ -37,7 +46,7 @@ def load_config(path: Path) -> dict:
         console.print("Скопируйте config.yaml.example -> config.yaml и заполните profile_url.")
         sys.exit(1)
     with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 
 def count_archived(archive_path: Path) -> int:
@@ -50,7 +59,7 @@ def count_archived(archive_path: Path) -> int:
 class DownloadLogger:
     """Bridge between yt-dlp's logging and rich console."""
 
-    _IGNORED_PATTERNS = ("Deprecated Feature:", "Support for Python version")
+    _IGNORED_PATTERNS = ("Deprecated Feature:",)
 
     def __init__(self):
         self.downloaded = []
@@ -126,7 +135,7 @@ def build_yt_dlp_opts(config: dict, archive_path: Path, force: bool, logger, hoo
     sc = config.get("soundcloud", {})
     out = config.get("output", {})
 
-    output_dir = Path(out.get("directory", "./Music")).resolve()
+    output_dir = music_dir(config)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     audio_fmt = out.get("format", "mp3")
@@ -147,6 +156,13 @@ def build_yt_dlp_opts(config: dict, archive_path: Path, force: bool, logger, hoo
         "progress_hooks": [hook],
         "sleep_requests": sc.get("sleep_requests", 1.5),
         "postprocessors": [
+            # Некоторые заливают трек с названием «… .mp3» — без этого «….mp3.mp3».
+            {
+                "key": "MetadataParser",
+                "when": "pre_process",
+                "actions": [(MetadataParserPP.Actions.REPLACE, "title",
+                             r"(?i)\.(?:mp3|wav|flac|m4a|aiff?|ogg|opus)$", "")],
+            },
             {
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": audio_fmt,
@@ -157,10 +173,6 @@ def build_yt_dlp_opts(config: dict, archive_path: Path, force: bool, logger, hoo
         ],
         "writethumbnail": True,
         "embedthumbnail": True,
-        "parse_metadata": [
-            "%(uploader)s:%(meta_artist)s",
-            "%(title)s:%(meta_title)s",
-        ],
     }
 
     if not force:
@@ -204,7 +216,7 @@ def extract_info_count(url: str, opts: dict) -> Optional[int]:
     return None
 
 
-def run_upload(config: dict, music_dir: Optional[Path] = None):
+def run_upload(config: dict, music_dir_override: Optional[Path] = None):
     """Upload downloaded tracks to Yandex Music playlist."""
     from ym_uploader import upload_to_yandex, collect_music_files
 
@@ -215,8 +227,7 @@ def run_upload(config: dict, music_dir: Optional[Path] = None):
         console.print("[red]Укажите playlist_url в секции yandex_music в config.yaml[/red]")
         return
 
-    out = config.get("output", {})
-    folder = music_dir or Path(out.get("directory", "./Music")).resolve()
+    folder = music_dir_override or music_dir(config)
     files = collect_music_files(folder)
 
     if not files:
@@ -428,8 +439,7 @@ def main():
 
 def show_stats(config: dict):
     """Display library statistics."""
-    out = config.get("output", {})
-    music_dir = Path(out.get("directory", "./Music")).resolve()
+    folder = music_dir(config)
     archive_path = DEFAULT_ARCHIVE_PATH
 
     archived = count_archived(archive_path)
@@ -437,9 +447,9 @@ def show_stats(config: dict):
     track_count = 0
     total_size = 0
 
-    if music_dir.exists():
-        for f in music_dir.rglob("*"):
-            if f.is_file() and f.suffix in (".mp3", ".m4a", ".opus", ".flac"):
+    if folder.exists():
+        for f in folder.rglob("*"):
+            if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
                 track_count += 1
                 total_size += f.stat().st_size
 
@@ -448,7 +458,7 @@ def show_stats(config: dict):
     table = Table(title="Статистика библиотеки", border_style="blue")
     table.add_column("Параметр", style="bold")
     table.add_column("Значение")
-    table.add_row("Папка", str(music_dir))
+    table.add_row("Папка", str(folder))
     table.add_row("Треков (файлов)", str(track_count))
     table.add_row("В архиве (ID)", str(archived))
     table.add_row("Размер", f"{size_mb:.1f} МБ")
