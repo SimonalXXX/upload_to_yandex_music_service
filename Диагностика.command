@@ -7,9 +7,13 @@ echo "  ♫  Диагностика авторизации Яндекс Музы
 echo "  ─────────────────────────────────────────"
 echo ""
 
-exec > >(tee "диагностика_отчет.txt") 2>&1
+PY=.venv/bin/python
+if [[ ! -x "$PY" ]]; then
+    echo "  ✗ Окружение .venv не найдено — сначала запустите Установка.command"
+    echo ""; read -p "  Нажмите Enter, чтобы закрыть…"; exit 1
+fi
 
-python3 - 2>&1 <<'PYEOF' | tee "диагностика_отчет.txt"
+"$PY" - 2>&1 <<'PYEOF' | tee "диагностика_отчет.txt"
 # -*- coding: utf-8 -*-
 import sys
 from pathlib import Path
@@ -18,8 +22,6 @@ OK, FAIL, WARN = "  ✓", "  ✗", "  ⚠"
 
 # ── 1. Chrome установлен? ──
 base = Path.home() / "Library/Application Support/Google/Chrome"
-if sys.platform != "darwin":
-    base = Path.home() / ".config/google-chrome"
 if not base.exists():
     print(f"{FAIL} Папка Chrome не найдена: {base}")
     print("    Установите Google Chrome и войдите в music.yandex.ru")

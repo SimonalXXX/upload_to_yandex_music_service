@@ -1,8 +1,9 @@
-yt-dlp>=2024.12.0
-mutagen>=1.47.0
-rich>=13.9.0
-PyYAML>=6.0.2
+# Python >= 3.10 (yt-dlp, requests, mutagen); установщик ставит python@3.14 в .venv
+yt-dlp>=2026.8.19
+mutagen>=1.48.1
+rich>=15.0.0
+PyYAML>=6.0.3
 schedule>=1.2.2
-requests>=2.32.0
-pycookiecheat>=0.7.0
-flask>=3.0.0
+requests>=2.34.2
+pycookiecheat>=0.8.0  # тянет cryptography==43.* — выше не поднять, пока нет новой версии
+flask>=3.1.3

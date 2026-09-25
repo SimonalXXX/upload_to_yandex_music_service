@@ -10,6 +10,8 @@ dim='\033[2m'
 bold='\033[1m'
 reset='\033[0m'
 
+PY_FORMULA="python@3.14"
+
 echo ""
 echo -e "${purple}  ♫  М У З Ы К А Л Ь Н Ы Й${reset}"
 echo -e "${dim}  Автоматическая установка${reset}"
@@ -20,7 +22,7 @@ fail() { echo -e "\n${red}  ✗ $1${reset}\n"; read -p "  Нажми Enter…"; 
 ok()   { echo -e "  ${green}✓${reset} $1"; }
 step() { echo -e "\n  ${yellow}→${reset} $1"; }
 
-# ── Xcode Command Line Tools (нужны для Homebrew и компиляции) ──
+# ── Xcode Command Line Tools (нужны для Homebrew) ──
 step "Проверяю базовые инструменты…"
 if xcode-select -p &>/dev/null; then
     ok "Xcode CLI tools есть"
@@ -36,6 +38,9 @@ fi
 
 # ── Homebrew ──
 step "Проверяю Homebrew…"
+for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [[ -x "$b" ]] && eval "$("$b" shellenv)" && break
+done
 if command -v brew &>/dev/null; then
     ok "Homebrew есть"
 else
@@ -53,15 +58,16 @@ else
     ok "Homebrew установлен"
 fi
 
-# ── Python 3 ──
+# ── Python ──
+# Системный /usr/bin/python3 (3.9) не подходит: свежий yt-dlp требует 3.10+.
 step "Проверяю Python…"
-if command -v python3 &>/dev/null; then
-    ok "$(python3 --version 2>&1)"
-else
-    echo -e "  ${dim}Устанавливаю Python 3…${reset}"
-    brew install python@3.12 || fail "Не удалось установить Python"
-    ok "$(python3 --version 2>&1)"
+if ! brew list --formula "$PY_FORMULA" &>/dev/null; then
+    echo -e "  ${dim}Устанавливаю ${PY_FORMULA}…${reset}"
+    brew install "$PY_FORMULA" || fail "Не удалось установить Python"
 fi
+PY="$(brew --prefix "$PY_FORMULA")/bin/python3.14"
+[[ -x "$PY" ]] || fail "Python не найден: $PY"
+ok "$("$PY" --version 2>&1)"
 
 # ── ffmpeg ──
 step "Проверяю ffmpeg…"
@@ -73,11 +79,17 @@ else
     ok "ffmpeg установлен"
 fi
 
-# ── Python-пакеты ──
+# ── Окружение и пакеты ──
 step "Устанавливаю компоненты программы…"
-python3 -m pip install -r requirements.txt --quiet --break-system-packages 2>/dev/null \
-  || python3 -m pip install -r requirements.txt --quiet 2>/dev/null \
-  || python3 -m pip install -r requirements.txt \
+# Пересоздаём .venv, если его нет или он собран на другой версии Python.
+if [[ ! -x .venv/bin/python ]] || \
+   [[ "$(.venv/bin/python -c 'import sys;print(sys.version_info[:2])' 2>/dev/null)" != \
+      "$("$PY" -c 'import sys;print(sys.version_info[:2])')" ]]; then
+    rm -rf .venv
+    "$PY" -m venv .venv || fail "Не удалось создать окружение .venv"
+fi
+.venv/bin/python -m pip install --upgrade pip --quiet || fail "Не удалось обновить pip"
+.venv/bin/python -m pip install --upgrade -r requirements.txt --quiet \
   || fail "Не удалось установить пакеты"
 ok "Все компоненты установлены"
 
@@ -95,4 +107,4 @@ echo ""
 echo -e "  ${bold}Запускаю приложение…${reset}"
 echo ""
 
-python3 web_app.py
+exec .venv/bin/python web_app.py
