@@ -1,0 +1,328 @@
+openapi: 3.1.0
+info:
+  title: Музыкальный — локальный HTTP API
+  description: |
+    REST API веб-приложения (`web_app.py`). Сервер слушает только 127.0.0.1.
+    Поток прогресса — отдельный контракт GET `/api/progress`, см. `sse-events.md`.
+  version: "1.0.0"
+
+servers:
+  - url: http://127.0.0.1:5555
+    description: Локальный экземпляр по умолчанию
+
+paths:
+  /:
+    get:
+      summary: Главная страница
+      description: HTML одностраничного приложения (встроенный шаблон).
+      responses:
+        "200":
+          description: HTML-документ
+
+  /api/status:
+    get:
+      summary: Текущее состояние UI и конфигурации
+      operationId: apiStatus
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /api/save:
+    post:
+      summary: Сохранить настройки SoundCloud и Яндекс Музыки
+      operationId: apiSave
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SaveRequest"
+      responses:
+        "200":
+          description: Сохранено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/scan:
+    post:
+      summary: Запустить сканирование лайков SoundCloud
+      operationId: apiScan
+      responses:
+        "200":
+          description: Задача запущена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "409":
+          description: Уже выполняется другая задача
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/start:
+    post:
+      summary: Скачать выбранные новые треки (опционально с загрузкой в ЯМ)
+      operationId: apiStart
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartRequest"
+      responses:
+        "200":
+          description: Задача запущена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          description: Нет результатов скана или новых треков
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Занято
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/upload:
+    post:
+      summary: Загрузить в Яндекс Музыку уже скачанные треки
+      operationId: apiUpload
+      responses:
+        "200":
+          description: Задача запущена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "409":
+          description: Занято
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/cancel:
+    post:
+      summary: Запросить отмену текущей задачи
+      description: Устанавливает флаг отмены; сброс active_task — в воркере или через force-clear.
+      operationId: apiCancel
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/force-clear:
+    post:
+      summary: Принудительно сбросить активную задачу
+      operationId: apiForceClear
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, cleared]
+                properties:
+                  ok:
+                    type: boolean
+                  cleared:
+                    description: Имя сброшенной задачи или null
+                    type: ["string", "null"]
+
+  /api/mark-uploaded:
+    post:
+      summary: Пометить треки как уже загруженные в ЯМ
+      operationId: apiMarkUploaded
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MarkUploadedRequest"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, marked]
+                properties:
+                  ok:
+                    type: boolean
+                  marked:
+                    type: integer
+        "400":
+          description: Нет ни track_ids, ни mark_all_pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Выполняется задача
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/open-folder:
+    post:
+      summary: Открыть папку с музыкой в файловом менеджере ОС
+      operationId: apiOpenFolder
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/check-yandex:
+    get:
+      summary: Проверить авторизацию в Яндекс Музыке (cookies Chrome)
+      operationId: apiCheckYandex
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/YandexAuthorized"
+                  - $ref: "#/components/schemas/YandexUnauthorized"
+
+  /api/progress:
+    get:
+      summary: Поток событий прогресса (SSE)
+      description: |
+        Формат: `text/event-stream`, каждая запись `data: <json>`.
+        Полное описание полей событий — в `sse-events.md`.
+      operationId: apiProgress
+      responses:
+        "200":
+          description: Бесконечный поток
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+components:
+  schemas:
+    OkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          const: true
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    TrackStats:
+      type: object
+      description: Агрегаты по tracks.csv + размер папки Music
+      properties:
+        total:
+          type: integer
+        uploaded:
+          type: integer
+        downloaded:
+          type: integer
+        pending:
+          type: integer
+        not_in_likes:
+          type: integer
+        local_files:
+          type: integer
+        size_mb:
+          type: number
+
+    StatusResponse:
+      type: object
+      properties:
+        username:
+          type: string
+          description: Имя пользователя SoundCloud из profile_url
+        playlist_url:
+          type: string
+        stats:
+          $ref: "#/components/schemas/TrackStats"
+        active_task:
+          description: Имя активной задачи или null
+          type: ["string", "null"]
+
+    SaveRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          description: Короткое имя или полный URL профиля SoundCloud
+        playlist_url:
+          type: string
+          nullable: true
+
+    StartRequest:
+      type: object
+      properties:
+        upload:
+          type: boolean
+          description: После скачивания загружать в ЯМ
+          default: true
+        track_ids:
+          type: array
+          items:
+            type: string
+          description: Список sc_id выбранных треков
+
+    MarkUploadedRequest:
+      type: object
+      description: |
+        Либо непустой track_ids, либо mark_all_pending=true (пометить все незавершённые кроме уже uploaded).
+      properties:
+        track_ids:
+          type: array
+          items:
+            type: string
+        mark_all_pending:
+          type: boolean
+
+    YandexAuthorized:
+      type: object
+      required: [authorized, login]
+      properties:
+        authorized:
+          type: boolean
+          const: true
+        login:
+          type: string
+
+    YandexUnauthorized:
+      type: object
+      required: [authorized]
+      properties:
+        authorized:
+          type: boolean
+          const: false
+        error:
+          type: string

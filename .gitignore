@@ -1,0 +1,17 @@
+Music/
+archive.txt
+upload_archive.txt
+tracks.csv
+tracks.json
+tracks.json.bak
+config.yaml
+ym_cookies.json
+.browser_data/
+.DS_Store
+__pycache__/
+*.pyc
+.env
+tracks.tmp
+.venv/
+.backup/
+диагностика_отчет.txt

@@ -1,0 +1,25 @@
+soundcloud:
+  profile_url: https://soundcloud.com/YOUR_USERNAME/likes
+  # Нужно только для ПРИВАТНЫХ лайков; требует установленный браузер.
+  # Если браузера нет — оставь закомментированным (при ошибке cookies
+  # приложение само продолжит без них).
+  # cookies_browser: chrome
+  max_tracks: 0        # 0 = все лайки, или число для ограничения
+  sleep_requests: 1.5  # пауза между запросами (сек)
+
+output:
+  directory: ./Music
+  format: mp3
+  quality: '320'       # битрейт: 128 / 192 / 256 / 320
+
+yandex_music:
+  playlist_url: ''     # URL плейлиста из Яндекс Музыки
+  auto_upload: false
+  upload_delay: 3      # пауза между загрузками в ЯМ (сек)
+  # После успешной загрузки в ЯМ через веб-интерфейс удалять локальный файл (CLI ym_uploader не трогает)
+  delete_after_upload: false
+
+schedule:
+  # Если true — при запуске sc_downloader.py без аргументов работает режим планировщика (как --schedule)
+  enabled: false
+  interval_hours: 6    # интервал автоматической проверки
