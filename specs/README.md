@@ -11,6 +11,7 @@
 | [`sse-events.md`](./sse-events.md) | Контракт событий `/api/progress` (SSE), типы и поля JSON |
 | [`cli-contract.md`](./cli-contract.md) | Контракт CLI (`sc_downloader.py`, `ym_uploader.py`) |
 | [`templates/feature-spec.md`](./templates/feature-spec.md) | Шаблон спецификации новой возможности |
+| [`features/ui-redesign.md`](./features/ui-redesign.md) | Новый интерфейс: раскладка, синхронизация, плеер, горячие клавиши, критерии приёмки |
 
 При противоречии приоритет такой: **спецификация API/SSE в `specs/` → код → SDD**, если явно не решено иначе в PR.
 
@@ -34,7 +35,7 @@
 Вручную:
 
 - REST: сверить маршруты в `web_app.py` с `openapi.yaml`.
-- SSE: сверить `_broadcast({...})` и клиентский `handleEvent` с `sse-events.md`.
+- SSE: сверить `_broadcast({...})` в `web_app.py` и `handleEvent` в `static/js/tasks.js` с `sse-events.md`.
 
 При желании можно подключить линтер OpenAPI (`spectral`) в CI — в репозитории пока не обязательно.
 

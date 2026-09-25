@@ -4,7 +4,12 @@ info:
   description: |
     REST API веб-приложения (`web_app.py`). Сервер слушает только 127.0.0.1.
     Поток прогресса — отдельный контракт GET `/api/progress`, см. `sse-events.md`.
-  version: "1.1.0"
+
+    **2.0.0** (новый интерфейс, `specs/features/ui-redesign.md`): удалён `POST /api/save`
+    (заменён `GET/POST /api/settings`); статус трека `unavailable`; задачи идут через общую
+    обёртку с историей (`/api/history`); добавлены синхронизация, проверки при вводе,
+    плеер, снятие отметки «В ЯМ».
+  version: "2.0.0"
 
 servers:
   - url: http://127.0.0.1:5555
@@ -14,14 +19,14 @@ paths:
   /:
     get:
       summary: Главная страница
-      description: HTML одностраничного приложения (встроенный шаблон).
+      description: HTML-оболочка (`templates/index.html`); интерфейс — ES-модули из `/static/js`.
       responses:
         "200":
           description: HTML-документ
 
   /api/status:
     get:
-      summary: Текущее состояние UI и конфигурации
+      summary: Состояние приложения
       operationId: apiStatus
       responses:
         "200":
@@ -31,49 +36,206 @@ paths:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
 
-  /api/save:
+  /api/settings:
+    get:
+      summary: Настройки в виде, удобном интерфейсу (с умолчаниями)
+      operationId: apiSettingsGet
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Settings"
     post:
-      summary: Сохранить настройки SoundCloud и Яндекс Музыки
-      operationId: apiSave
+      summary: Частично обновить настройки
+      description: |
+        Передаются только изменённые поля (та же структура, что в ответе GET). Все поля
+        проверяются до записи: при ошибке `config.yaml` не меняется. Секции CLI (`schedule`,
+        `yandex_music.auto_upload`) не затрагиваются.
+      operationId: apiSettingsPost
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SaveRequest"
+              $ref: "#/components/schemas/SettingsPatch"
       responses:
         "200":
-          description: Сохранено
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, settings]
+                properties:
+                  ok:
+                    type: boolean
+                  settings:
+                    $ref: "#/components/schemas/Settings"
+        "400":
+          description: Неверное значение
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  field:
+                    type: string
+                    description: Путь поля, например `yandex_music.upload_delay`
+
+  /api/validate/soundcloud:
+    post:
+      summary: Проверить профиль SoundCloud (для проверки при вводе)
+      operationId: apiValidateSoundcloud
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                  description: Имя или любая ссылка на профиль
+      responses:
+        "200":
+          description: "`ok: false` — профиль не найден или пустой ввод"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, username, profile_url, display_name]
+                    properties:
+                      ok: { type: boolean, const: true }
+                      username: { type: string }
+                      profile_url: { type: string }
+                      display_name: { type: string }
+                      likes_count: { type: ["integer", "null"] }
+                  - $ref: "#/components/schemas/NotOk"
+        "502":
+          description: SoundCloud недоступен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotOk"
+
+  /api/validate/playlist:
+    post:
+      summary: Проверить ссылку на плейлист ЯМ (свой ли, название, число треков)
+      description: Требует авторизации ЯМ (cookies Chrome).
+      operationId: apiValidatePlaylist
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                playlist_url:
+                  type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [ok, kind, title]
+                    properties:
+                      ok: { type: boolean, const: true }
+                      kind: { type: string }
+                      title: { type: string }
+                      track_count: { type: ["integer", "null"] }
+                      owner: { type: string }
+                  - $ref: "#/components/schemas/NotOk"
+
+  /api/check-yandex:
+    get:
+      summary: Проверить авторизацию в Яндекс Музыке (cookies Chrome)
+      description: Успешный результат кэшируется на 10 минут; `refresh=1` — проверить заново.
+      operationId: apiCheckYandex
+      parameters:
+        - name: refresh
+          in: query
+          schema:
+            type: string
+            enum: ["1"]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/YandexAuthorized"
+                  - $ref: "#/components/schemas/YandexUnauthorized"
+
+  /api/tracks:
+    get:
+      summary: Все треки из локальной базы
+      description: Последние добавленные — сверху.
+      operationId: apiTracks
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tracks]
+                properties:
+                  tracks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TrackItem"
+
+  /api/tracks/{id}/audio:
+    get:
+      summary: Аудиофайл трека для плеера
+      description: Поддерживает Range (перемотка), ответ 206.
+      operationId: apiTrackAudio
+      parameters:
+        - $ref: "#/components/parameters/TrackId"
+      responses:
+        "200":
+          description: Файл целиком
+          content:
+            audio/mpeg: {}
+        "206":
+          description: Часть файла
+        "404":
+          description: Трека нет или у него нет файла
+
+  /api/tracks/{id}/reveal:
+    post:
+      summary: Показать файл трека в Finder
+      operationId: apiTrackReveal
+      parameters:
+        - $ref: "#/components/parameters/TrackId"
+      responses:
+        "200":
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/OkResponse"
+        "404":
+          description: Трека нет или у него нет файла
 
   /api/scan:
     post:
-      summary: Запустить сканирование лайков SoundCloud
+      summary: Проверить лайки SoundCloud (задача `scan`)
       operationId: apiScan
       responses:
         "200":
-          description: Задача запущена
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OkResponse"
+          $ref: "#/components/responses/Started"
         "409":
-          description: Уже выполняется другая задача
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Busy"
 
   /api/start:
     post:
-      summary: Скачать выбранные треки (опционально с загрузкой в ЯМ)
+      summary: Скачать выбранные треки, опционально с загрузкой в ЯМ (задача `download`)
       description: |
-        Треки берутся из локальной базы `tracks.csv` (по `sc_url`), предварительный
-        скан не нужен — после перезапуска приложения скачивание доступно сразу.
-        Без `track_ids` скачиваются все треки со статусом `pending`.
+        Треки берутся из `tracks.csv` (по `sc_url`), предварительный скан не нужен.
+        Без `track_ids` — все `pending`. Трек с файлом не перекачивается.
         Отсутствие подходящих треков сообщается событием SSE `error`, не HTTP-кодом.
       operationId: apiStart
       requestBody:
@@ -83,11 +245,7 @@ paths:
               $ref: "#/components/schemas/StartRequest"
       responses:
         "200":
-          description: Задача запущена
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OkResponse"
+          $ref: "#/components/responses/Started"
         "400":
           description: track_ids передан, но не является списком
           content:
@@ -95,36 +253,54 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "409":
-          description: Занято (выполняется задача или предыдущая ещё останавливается)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Busy"
 
   /api/upload:
     post:
-      summary: Загрузить в Яндекс Музыку уже скачанные треки
+      summary: Загрузить в ЯМ уже скачанные треки (задача `upload`)
+      description: С `track_ids` — выбранные треки с файлами (в т.ч. уже «В ЯМ»); без — все `downloaded`.
       operationId: apiUpload
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                track_ids:
+                  type: array
+                  items:
+                    type: string
       responses:
         "200":
-          description: Задача запущена
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OkResponse"
-        "409":
-          description: Занято
+          $ref: "#/components/responses/Started"
+        "400":
+          description: track_ids не список
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/Busy"
+
+  /api/sync:
+    post:
+      summary: Синхронизировать (задача `sync`)
+      description: |
+        Проверить лайки → скачать все `pending` → загрузить в ЯМ все `downloaded` (если задан
+        плейлист) → сверить плейлист. Тот же сценарий запускает автосинхронизация (`trigger: auto`).
+      operationId: apiSync
+      responses:
+        "200":
+          $ref: "#/components/responses/Started"
+        "409":
+          $ref: "#/components/responses/Busy"
 
   /api/cancel:
     post:
       summary: Запросить отмену текущей задачи
       description: |
         Устанавливает флаг отмены; active_task сбрасывает сам воркер, когда остановится
-        (текущий шаг ffmpeg дорабатывает до конца). Итог — событие SSE `cancelled`.
+        (текущий шаг ffmpeg дорабатывает до конца). Итог — события SSE `cancelled` и `task_end`.
       operationId: apiCancel
       responses:
         "200":
@@ -161,18 +337,14 @@ paths:
                 type: object
                 required: [ok, alive, error]
                 properties:
-                  ok:
-                    type: boolean
-                    const: false
-                  alive:
-                    type: boolean
-                    const: true
-                  error:
-                    type: string
+                  ok: { type: boolean, const: false }
+                  alive: { type: boolean, const: true }
+                  error: { type: string }
 
   /api/mark-uploaded:
     post:
       summary: Пометить треки как уже загруженные в ЯМ
+      description: Переводит `pending`, `downloaded`, `not_in_likes`, `unavailable` → `uploaded`.
       operationId: apiMarkUploaded
       requestBody:
         content:
@@ -187,12 +359,51 @@ paths:
                 type: object
                 required: [ok, marked]
                 properties:
-                  ok:
-                    type: boolean
-                  marked:
-                    type: integer
+                  ok: { type: boolean }
+                  marked: { type: integer }
         "400":
           description: Нет ни track_ids, ни mark_all_pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Выполняется задача
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/unmark-uploaded:
+    post:
+      summary: Снять отметку «В ЯМ»
+      description: |
+        `uploaded` → `downloaded` (есть файл) или `pending` (нет файла); файл убирается из
+        `upload_archive.txt`, чтобы его можно было загрузить снова.
+      operationId: apiUnmarkUploaded
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [track_ids]
+              properties:
+                track_ids:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, unmarked]
+                properties:
+                  ok: { type: boolean }
+                  unmarked: { type: integer }
+        "400":
+          description: Нет track_ids
           content:
             application/json:
               schema:
@@ -220,40 +431,24 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
-  /api/check-yandex:
+  /api/check-playlist:
     get:
-      summary: Проверить авторизацию в Яндекс Музыке (cookies Chrome)
-      operationId: apiCheckYandex
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                oneOf:
-                  - $ref: "#/components/schemas/YandexAuthorized"
-                  - $ref: "#/components/schemas/YandexUnauthorized"
-
-  /api/tracks:
-    get:
-      summary: Все треки из локальной базы
-      description: Для показа списка сразу при загрузке страницы, без скана SoundCloud. Последние добавленные — сверху.
-      operationId: apiTracks
+      summary: Последний результат сверки (от кнопки или синхронизации), без обращения к ЯМ
+      operationId: apiCheckPlaylistLast
       responses:
         "200":
           content:
             application/json:
               schema:
                 type: object
-                required: [tracks]
+                required: [report]
                 properties:
-                  tracks:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/TrackItem"
-
-  /api/check-playlist:
+                  report:
+                    oneOf:
+                      - $ref: "#/components/schemas/PlaylistReport"
+                      - type: "null"
     post:
-      summary: Сверить треки «в ЯМ» из локальной базы с плейлистом Яндекс Музыки
+      summary: Сверить треки «В ЯМ» из локальной базы с плейлистом Яндекс Музыки
       description: |
         Сопоставление по нормализованным исполнителю и названию (или только названию).
         Статусы не меняет. Плейлист должен принадлежать текущему аккаунту.
@@ -263,25 +458,67 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PlaylistCheck"
+                $ref: "#/components/schemas/PlaylistReport"
         "400":
-          description: URL плейлиста не задан или плейлист не определён
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "401":
-          description: Нет авторизации в ЯМ
+          description: URL плейлиста не задан
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "502":
-          description: Ошибка API Яндекс Музыки (в т.ч. чужой плейлист)
+          description: Нет авторизации, чужой/не найденный плейлист или ошибка API ЯМ
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+
+  /api/history:
+    get:
+      summary: История операций (последние 50, новые сверху), без журналов
+      operationId: apiHistory
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/HistoryRecordBase"
+                        - type: object
+                          properties:
+                            events_count: { type: integer }
+
+  /api/history/{id}:
+    get:
+      summary: Запись истории с журналом событий
+      operationId: apiHistoryItem
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/HistoryRecordBase"
+                  - type: object
+                    properties:
+                      events:
+                        type: array
+                        description: События SSE задачи (без прогресса), до 300; поле `t` — время
+                        items:
+                          type: object
+        "404":
+          description: Нет такой записи
 
   /api/progress:
     get:
@@ -299,6 +536,29 @@ paths:
                 type: string
 
 components:
+  parameters:
+    TrackId:
+      name: id
+      in: path
+      required: true
+      description: SoundCloud id трека
+      schema:
+        type: string
+
+  responses:
+    Started:
+      description: Задача запущена
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OkResponse"
+    Busy:
+      description: Выполняется другая задача или предыдущая ещё останавливается
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
   schemas:
     OkResponse:
       type: object
@@ -315,52 +575,103 @@ components:
         error:
           type: string
 
+    NotOk:
+      type: object
+      required: [ok, error]
+      properties:
+        ok: { type: boolean, const: false }
+        error: { type: string }
+
     TrackStats:
       type: object
-      description: Агрегаты по tracks.csv + размер папки Music
+      description: Агрегаты по tracks.csv + размер папки музыки
       properties:
-        total:
-          type: integer
-        uploaded:
-          type: integer
-        downloaded:
-          type: integer
-        pending:
-          type: integer
-        not_in_likes:
-          type: integer
-        local_files:
-          type: integer
-        size_mb:
-          type: number
+        total: { type: integer }
+        pending: { type: integer }
+        downloaded: { type: integer }
+        uploaded: { type: integer }
+        not_in_likes: { type: integer }
+        unavailable: { type: integer }
+        not_in_ym: { type: integer, description: Все, кроме uploaded }
+        with_errors: { type: integer, description: С сохранённой ошибкой, кроме unavailable }
+        local_files: { type: integer }
+        size_mb: { type: number }
 
     StatusResponse:
       type: object
       properties:
         username:
           type: string
-          description: Имя пользователя SoundCloud из profile_url
+          description: Имя пользователя SoundCloud (пусто — не настроено)
+        configured:
+          type: boolean
+          description: false — показать мастер первого запуска
         playlist_url:
           type: string
         stats:
           $ref: "#/components/schemas/TrackStats"
         active_task:
-          description: Имя активной задачи или null
+          description: scan | download | upload | sync | null
           type: ["string", "null"]
+        task:
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                name: { type: string }
+                trigger: { type: string, enum: [manual, auto] }
+                started_at: { type: number }
+        autosync:
+          allOf:
+            - $ref: "#/components/schemas/AutosyncSettings"
+            - type: object
+              properties:
+                last_run: { type: ["number", "null"], description: Начало последнего автозапуска (unix) }
+                next_run: { type: ["number", "null"], description: "Следующий запуск (unix); null — выключено" }
 
-    SaveRequest:
+    Settings:
       type: object
       properties:
-        username:
-          type: string
-          description: Короткое имя или полный URL профиля SoundCloud
-        playlist_url:
-          type: string
-          nullable: true
+        soundcloud:
+          type: object
+          properties:
+            username: { type: string }
+            profile_url: { type: string, description: Только чтение }
+            max_tracks: { type: integer, minimum: 0, description: 0 — все }
+            sleep_requests: { type: number, minimum: 0, maximum: 30 }
+            cookies_browser: { type: string, enum: ["", chrome, safari, firefox, brave, edge, chromium, opera, vivaldi] }
+        output:
+          type: object
+          properties:
+            directory: { type: string }
+            resolved_directory: { type: string, description: Только чтение — абсолютный путь }
+            format: { type: string, enum: [mp3, m4a, opus, flac] }
+            quality: { type: string, enum: ["128", "192", "256", "320"] }
+        yandex_music:
+          type: object
+          properties:
+            playlist_url: { type: string }
+            upload_delay: { type: number, minimum: 0, maximum: 60 }
+            delete_after_upload: { type: boolean }
+        autosync:
+          $ref: "#/components/schemas/AutosyncSettings"
+
+    SettingsPatch:
+      description: Любое подмножество полей Settings (кроме «только чтение»)
+      type: object
+
+    AutosyncSettings:
+      type: object
+      properties:
+        enabled: { type: boolean, default: false }
+        interval_hours: { type: integer, enum: [1, 3, 6, 12, 24], default: 6 }
+        download: { type: boolean, default: true }
+        upload: { type: boolean, default: true }
+        notify: { type: boolean, default: true, description: Уведомление macOS после автосинхронизации }
 
     TrackItem:
       type: object
-      required: [id, title, artist, status]
+      required: [id, title, artist, status, added, error, has_file, sc_url]
       properties:
         id:
           type: string
@@ -372,34 +683,67 @@ components:
           description: Может быть пустым до скачивания — плоский скан лайков не отдаёт исполнителя
         status:
           type: string
-          enum: [pending, downloaded, uploaded, not_in_likes]
+          enum: [pending, downloaded, uploaded, not_in_likes, unavailable]
+        added:
+          type: string
+          description: Дата появления в базе, YYYY-MM-DD
+        error:
+          type: string
+          description: Последняя ошибка; для unavailable — причина недоступности
+        has_file:
+          type: boolean
+        sc_url:
+          type: string
 
-    PlaylistCheck:
+    PlaylistReport:
       type: object
       properties:
-        playlist_total:
-          type: integer
-        found:
-          type: integer
-        missing_total:
-          type: integer
+        checked_at: { type: number }
+        playlist:
+          type: object
+          properties:
+            kind: { type: string }
+            title: { type: string }
+            track_count: { type: ["integer", "null"] }
+            owner: { type: string }
+        playlist_total: { type: integer }
+        found: { type: integer }
+        missing_total: { type: integer }
         missing:
           type: array
-          description: Первые 30 ненайденных
+          description: Все ненайденные треки «В ЯМ»
+          items:
+            $ref: "#/components/schemas/TrackItem"
+        duplicates: { type: integer, description: Число лишних копий }
+        duplicates_list:
+          type: array
           items:
             type: object
             properties:
-              id:
-                type: string
-              title:
-                type: string
-              artist:
-                type: string
-        duplicates:
-          type: integer
-        processing:
-          type: integer
-          description: Треки плейлиста, ещё недоступные для прослушивания (обработка)
+              artist: { type: string }
+              title: { type: string }
+              count: { type: integer }
+        processing: { type: integer }
+        processing_list:
+          type: array
+          items:
+            type: object
+            properties:
+              artist: { type: string }
+              title: { type: string }
+
+    HistoryRecordBase:
+      type: object
+      properties:
+        id: { type: string }
+        task: { type: string, enum: [scan, download, upload, sync] }
+        trigger: { type: string, enum: [manual, auto] }
+        started_at: { type: number }
+        finished_at: { type: ["number", "null"] }
+        status: { type: string, enum: [ok, warn, error, cancelled] }
+        summary:
+          type: object
+          description: Итог задачи (поля all_done / scan_complete / cancelled) или {message} при ошибке
 
     StartRequest:
       type: object
@@ -417,7 +761,7 @@ components:
     MarkUploadedRequest:
       type: object
       description: |
-        Либо непустой track_ids, либо mark_all_pending=true (пометить все незавершённые кроме уже uploaded).
+        Либо непустой track_ids, либо mark_all_pending=true (пометить все, кроме уже uploaded).
       properties:
         track_ids:
           type: array
@@ -430,18 +774,14 @@ components:
       type: object
       required: [authorized, login]
       properties:
-        authorized:
-          type: boolean
-          const: true
-        login:
-          type: string
+        authorized: { type: boolean, const: true }
+        login: { type: string }
+        uid: { type: integer }
+        cached: { type: boolean }
 
     YandexUnauthorized:
       type: object
       required: [authorized]
       properties:
-        authorized:
-          type: boolean
-          const: false
-        error:
-          type: string
+        authorized: { type: boolean, const: false }
+        error: { type: string }
