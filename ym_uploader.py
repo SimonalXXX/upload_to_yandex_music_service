@@ -28,7 +28,8 @@ from rich.table import Table
 console = Console()
 
 SUPPORTED_FORMATS = {".mp3", ".m4a", ".opus", ".flac", ".ogg", ".wav", ".aac"}
-DEFAULT_UPLOAD_ARCHIVE = Path(__file__).parent / "upload_archive.txt"
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_UPLOAD_ARCHIVE = BASE_DIR / "upload_archive.txt"
 MIME_MAP = {
     ".mp3": "audio/mpeg",
     ".m4a": "audio/mp4",
@@ -70,27 +71,38 @@ def collect_music_files(directory: Path) -> List[Path]:
 
 
 def _load_upload_archive(path: Path) -> Set[str]:
+    """Имена уже загруженных файлов.
+
+    Сверяем по имени файла, а не по полному пути: пути в архиве (старые —
+    абсолютные) ломаются при переносе папки проекта, а имя «артист - трек.mp3»
+    в плоской папке Music и так уникально.
+    """
     if not path.exists():
         return set()
     with open(path, encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
+        return {Path(line.strip()).name for line in f if line.strip()}
 
 
 def _record_uploaded(path: Path, filepath: Path) -> None:
-    entry = str(filepath.resolve())
-    if entry in _load_upload_archive(path):
+    if filepath.name in _load_upload_archive(path):
         return
+    p = filepath.resolve()
+    entry = str(p.relative_to(BASE_DIR)) if p.is_relative_to(BASE_DIR) else str(p)
     with open(path, "a", encoding="utf-8") as f:
         f.write(entry + "\n")
 
 
+def _wait(seconds: float, cancel_event=None) -> None:
+    """Пауза, которую прерывает «Остановить» (threading.Event) — тогда RuntimeError."""
+    if cancel_event is None:
+        time.sleep(seconds)
+    elif cancel_event.wait(seconds):
+        raise RuntimeError("Отменено")
+
+
 def _chrome_cookie_files() -> List[Path]:
-    """Файлы Cookies всех профилей Chrome (Default, Profile 1, …)."""
-    import sys
-    if sys.platform == "darwin":
-        base = Path.home() / "Library/Application Support/Google/Chrome"
-    else:
-        base = Path.home() / ".config/google-chrome"
+    """Файлы Cookies всех профилей Chrome (Default, Profile 1, …) на macOS."""
+    base = Path.home() / "Library/Application Support/Google/Chrome"
     if not base.exists():
         return []
     files: List[Path] = []
@@ -267,48 +279,68 @@ def _playlist_kind_from_url(playlist_url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _playlist_owner_from_url(playlist_url: str) -> Optional[str]:
+    """Логин владельца из старых ссылок вида /users/<login>/playlists/<kind>."""
+    m = re.search(r"/users/([^/?#]+)/playlists/", playlist_url)
+    return m.group(1) if m else None
+
+
+def _api_get_result(session: requests.Session, url: str, token: str, uid: int):
+    r = session.get(url, headers=_api_headers(token, uid), timeout=30)
+    if not r.ok:
+        return None
+    body = r.json()
+    return body.get("result", body) if isinstance(body, dict) else body
+
+
 def _resolve_playlist_kind(
     session: requests.Session,
     playlist_url: str,
     token: str,
     uid: int,
 ) -> Optional[str]:
-    """Определяет numeric kind плейлиста (в т.ч. для URL с UUID)."""
+    """Определяет numeric kind СВОЕГО плейлиста по ссылке (обычной или с UUID).
+
+    Загрузка всегда идёт в «{uid}:{kind}» текущего аккаунта, поэтому ссылка на
+    чужой плейлист молча отправила бы треки в ваш плейлист с тем же номером.
+    Такие ссылки отклоняем (RuntimeError). Возвращает None, если плейлист не найден.
+    """
     kind = _playlist_kind_from_url(playlist_url)
-    if kind:
-        return kind
-
     playlist_uuid = _playlist_uuid_from_url(playlist_url)
-    if playlist_uuid:
-        r = session.get(
-            f"{API_BASE}/users/{uid}/playlists/list",
-            headers=_api_headers(token, uid),
-            timeout=30,
-        )
-        if r.ok:
-            body = r.json()
-            playlists = body if isinstance(body, list) else body.get("result", [])
-            for pl in playlists:
-                if pl.get("playlistUuid") == playlist_uuid:
-                    return str(pl.get("kind"))
-        r = session.get(
-            f"{API_BASE}/playlist/{playlist_uuid}",
-            headers=_api_headers(token, uid),
-            timeout=30,
-        )
-        if r.ok:
-            body = r.json()
-            pl = body.get("result", body) if isinstance(body, dict) else {}
-            kind = pl.get("kind") if isinstance(pl, dict) else None
-            if kind is not None:
-                return str(kind)
 
-    r = session.get(playlist_url, timeout=30)
-    if r.ok:
-        kinds = re.findall(r'"kind":(\d+)', r.text)
-        if kinds:
-            return kinds[0]
-    return None
+    if kind is None and playlist_uuid:
+        own = _api_get_result(session, f"{API_BASE}/users/{uid}/playlists/list", token, uid)
+        for pl in own if isinstance(own, list) else []:
+            if pl.get("playlistUuid") == playlist_uuid:
+                kind = str(pl.get("kind"))
+                break
+        if kind is None:
+            pl = _api_get_result(session, f"{API_BASE}/playlist/{playlist_uuid}", token, uid)
+            if isinstance(pl, dict) and pl.get("kind") is not None:
+                owner_uid = (pl.get("owner") or {}).get("uid", pl.get("uid"))
+                if owner_uid is not None and str(owner_uid) != str(uid):
+                    raise RuntimeError(
+                        "Плейлист принадлежит другому пользователю — загружать можно "
+                        "только в свой плейлист"
+                    )
+                kind = str(pl["kind"])
+    if kind is None:
+        return None
+
+    # Проверяем, что uid:kind существует в НАШЕМ аккаунте и совпадает со ссылкой.
+    pl = _api_get_result(session, f"{API_BASE}/users/{uid}/playlists/{kind}", token, uid)
+    if not isinstance(pl, dict):
+        raise RuntimeError(f"Плейлист {kind} не найден в вашем аккаунте Яндекс Музыки")
+    url_owner = _playlist_owner_from_url(playlist_url)
+    owner_login = (pl.get("owner") or {}).get("login")
+    if url_owner and owner_login and url_owner.lower() != owner_login.lower():
+        raise RuntimeError(
+            f"Ссылка ведёт на плейлист пользователя {url_owner}, а вы вошли как "
+            f"{owner_login} — загружать можно только в свой плейлист"
+        )
+    if playlist_uuid and pl.get("playlistUuid") and pl["playlistUuid"] != playlist_uuid:
+        raise RuntimeError("Плейлист по ссылке не совпадает с найденным в аккаунте")
+    return kind
 
 
 def _get_upload_target(
@@ -318,6 +350,7 @@ def _get_upload_target(
     filename: str,
     token: str,
     retries: int = 3,
+    cancel_event=None,
 ) -> dict:
     """Запрашивает post-target для загрузки (POST loader/upload-url на api.music.yandex.ru)."""
     del token  # загрузка идёт по cookies, OAuth нужен только для account/playlists
@@ -341,7 +374,7 @@ def _get_upload_target(
                 data = r.json()
             except ValueError:
                 last_error = "Ответ API не JSON (возможна капча SmartCaptcha)"
-                time.sleep(3 * (attempt + 1))
+                _wait(3 * (attempt + 1), cancel_event)
                 continue
             if isinstance(data, dict) and "post-target" in data:
                 return data
@@ -350,7 +383,7 @@ def _get_upload_target(
             last_error = f"Неожиданный ответ: {str(data)[:120]}"
         else:
             last_error = f"HTTP {r.status_code}: {_parse_api_error(r)}"
-        time.sleep(3 * (attempt + 1))
+        _wait(3 * (attempt + 1), cancel_event)
 
     raise RuntimeError(
         "Не удалось получить URL загрузки. "
@@ -430,8 +463,12 @@ def _verify_uploaded(
     delay: float = 5,
     cancel_event=None,
     count_before: Optional[int] = None,
-) -> bool:
+) -> Optional[str]:
     """Подтверждает по списку треков плейлиста, что трек реально доехал и проигрываем.
+
+    Возвращает "id" — трек найден по ugc-track-id и проигрываем; "count" — трек по
+    id не найден, но плейлист вырос (слабое подтверждение: рост мог дать и ранее
+    принятый трек, дообработавшийся только сейчас); None — не подтверждено.
 
     Начальный POST на loader может вернуть 200/201 ещё до того, как асинхронная
     обработка файла на их стороне провалится — сам факт HTTP-успеха ничего не
@@ -461,7 +498,8 @@ def _verify_uploaded(
                     if ugc_track_id is not None and str(ugc_track_id) in (
                         str(tr.get("id")), str(tr.get("realId"))
                     ):
-                        return tr.get("state") == "playable" or bool(tr.get("available"))
+                        playable = tr.get("state") == "playable" or bool(tr.get("available"))
+                        return "id" if playable else None
                 # ЯМ может присвоить треку ДРУГОЙ id после обработки — тогда
                 # сверка по id не сработает никогда. Подстраховка: плейлист вырос.
                 if count_before is not None:
@@ -469,18 +507,18 @@ def _verify_uploaded(
                     if current is None:
                         current = len(tracks)
                     if isinstance(current, int) and current > count_before:
-                        return True
+                        return "count"
         except requests.exceptions.RequestException:
             pass
         if cancel_event is not None and cancel_event.is_set():
-            return False
+            return None
         if attempt < retries - 1:
             if cancel_event is not None:
                 if cancel_event.wait(delay):
-                    return False
+                    return None
             else:
                 time.sleep(delay)
-    return False
+    return None
 
 
 def _upload_one(
@@ -494,9 +532,11 @@ def _upload_one(
 ):
     """Запрашивает upload-target, заливает файл и подтверждает результат по плейлисту.
 
-    Возвращает: True — подтверждено в плейлисте; "accepted" (истинно) — файл
-    принят сервером, но подтверждение не успело прийти (проверьте плейлист);
-    исключение — загрузка не удалась.
+    Возвращает: True — подтверждено в плейлисте по id трека; "grown" (истинно) —
+    по id не найден, но плейлист вырос (почти наверняка доехал, но не 100%);
+    "accepted" (истинно) — файл принят сервером, но подтверждение не успело
+    прийти (проверьте плейлист); исключение — загрузка не удалась.
+    Удалять локальный файл безопасно только при True.
 
     Повторная попытка — ТОЛЬКО если сам POST не прошёл (сетевой сбой/не-2xx):
     post-target одноразовый, запрашиваем новый и повторяем. Если сервер файл
@@ -513,7 +553,9 @@ def _upload_one(
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("Отменено")
         count_before = _playlist_track_count(session, uid, kind, token)
-        target = _get_upload_target(session, uid, kind, filepath.name, token)
+        target = _get_upload_target(
+            session, uid, kind, filepath.name, token, cancel_event=cancel_event
+        )
         ugc_id = target.get("ugc-track-id")
         http_ok = False
         try:
@@ -522,12 +564,16 @@ def _upload_one(
             last_error = e
         if ugc_id is None and count_before is None:
             if http_ok:
-                return True  # проверить нечем — доверяем HTTP-статусу
-        elif _verify_uploaded(
-            session, uid, kind, ugc_id, token,
-            cancel_event=cancel_event, count_before=count_before,
-        ):
-            return True
+                return "accepted"  # проверить нечем — принят, но не подтверждён
+        else:
+            verified = _verify_uploaded(
+                session, uid, kind, ugc_id, token,
+                cancel_event=cancel_event, count_before=count_before,
+            )
+            if verified == "id":
+                return True
+            if verified == "count":
+                return "grown"
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("Отменено")
         if http_ok:
@@ -541,11 +587,7 @@ def _upload_one(
         if last_error is None:
             last_error = RuntimeError("Загрузка файла не удалась")
         if attempt < retries - 1:
-            if cancel_event is not None:
-                if cancel_event.wait(3 * (attempt + 1)):
-                    raise RuntimeError("Отменено")
-            else:
-                time.sleep(3 * (attempt + 1))
+            _wait(3 * (attempt + 1), cancel_event)
     raise last_error
 
 
@@ -567,7 +609,7 @@ def upload_to_yandex(
     if not force:
         already = _load_upload_archive(archive)
         before = len(audio_files)
-        audio_files = [f for f in audio_files if str(f.resolve()) not in already]
+        audio_files = [f for f in audio_files if f.name not in already]
         skipped = before - len(audio_files)
         if skipped:
             results["skipped"] = [f"({skipped} ранее загруженных)"]
@@ -612,7 +654,11 @@ def upload_to_yandex(
         f"  [green]Авторизация OK:[/green] {auth.get('login', '?')} (uid {uid})"
     )
 
-    kind = _resolve_playlist_kind(session, playlist_url, token, uid)
+    try:
+        kind = _resolve_playlist_kind(session, playlist_url, token, uid)
+    except Exception as e:
+        console.print(f"[red]Плейлист:[/red] {e}")
+        return results
     if not kind:
         console.print("[red]Не удалось определить ID плейлиста[/red]")
         return results
