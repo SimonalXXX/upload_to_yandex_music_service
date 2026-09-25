@@ -1,0 +1,16 @@
+{
+  "name": "Музыкальный",
+  "short_name": "Музыкальный",
+  "description": "Лайки SoundCloud → плейлист Яндекс Музыки",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1e1e1f",
+  "theme_color": "#fa2d48",
+  "icons": [
+    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/static/icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f2f2f4" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#232325" media="(prefers-color-scheme: dark)">
+<title>Музыкальный</title>
+<link rel="icon" href="/static/icons/icon.svg?v={{ v }}" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png?v={{ v }}">
+<link rel="manifest" href="/static/manifest.webmanifest?v={{ v }}">
+<link rel="stylesheet" href="/static/css/app.css?v={{ v }}">
+<script type="module" src="/static/js/main.js?v={{ v }}"></script>
+</head>
+<body>
+<div class="app" id="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Разделы">
+    <div class="sidebar-scroll">
+      <div class="brand"><span class="brand-icon" data-icon="music"></span>Музыкальный</div>
+      <nav id="nav"></nav>
+    </div>
+    <button class="sidebar-footer" id="sidebar-footer" type="button" title="Открыть настройки"></button>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+
+  <main class="main">
+    <header class="toolbar">
+      <button class="icon-btn only-narrow" id="btn-menu" type="button" aria-label="Разделы" data-icon="menu"></button>
+      <div class="toolbar-title">
+        <h1 id="view-title">Медиатека</h1>
+        <div class="subtitle" id="view-subtitle"></div>
+      </div>
+      <div class="toolbar-spacer"></div>
+
+      <div class="activity" id="activity" hidden>
+        <button class="activity-main" id="activity-main" type="button" aria-expanded="false" aria-controls="activity-pop">
+          <svg class="ring" viewBox="0 0 20 20" aria-hidden="true"><circle class="ring-bg" cx="10" cy="10" r="8"/><circle class="ring-fg" id="ring-fg" cx="10" cy="10" r="8"/></svg>
+          <span class="activity-text"><b id="act-phase"></b><span id="act-detail"></span></span>
+        </button>
+        <button class="icon-btn stop" id="btn-stop" type="button" title="Остановить (⌘.)" aria-label="Остановить" data-icon="stop"></button>
+        <div class="popover" id="activity-pop" hidden>
+          <div class="popover-head">Журнал задачи</div>
+          <div class="log" id="activity-log"></div>
+        </div>
+      </div>
+
+      <div class="search lib-only">
+        <span data-icon="search"></span>
+        <input type="search" id="search" placeholder="Поиск" aria-label="Поиск по названию и исполнителю" autocomplete="off" spellcheck="false">
+      </div>
+      <select class="lib-only" id="sort" aria-label="Сортировка">
+        <option value="added">Сначала новые</option>
+        <option value="artist">По исполнителю</option>
+        <option value="title">По названию</option>
+      </select>
+      <button class="btn" id="btn-scan" type="button" title="Проверить лайки SoundCloud"><span data-icon="heart"></span><span class="lbl">Проверить лайки</span></button>
+      <button class="btn primary" id="btn-sync" type="button" title="Проверить лайки → скачать новые → загрузить в ЯМ → сверить"><span data-icon="sync"></span><span class="lbl">Синхронизировать</span></button>
+    </header>
+
+    <section class="view" id="view-library" aria-label="Медиатека">
+      <div class="list-head" role="presentation">
+        <label class="cell chk"><input type="checkbox" id="chk-all" aria-label="Выбрать все в текущем списке"></label>
+        <span class="cell art"></span>
+        <span class="cell">Название</span>
+        <span class="cell added">Добавлен</span>
+        <span class="cell">Статус</span>
+        <button class="cell pick" id="btn-pick" type="button">Выбрать <span data-icon="chevron"></span></button>
+      </div>
+      <div class="list" id="list" tabindex="0" role="listbox" aria-multiselectable="true" aria-label="Треки">
+        <div class="list-sizer" id="list-sizer"></div>
+      </div>
+      <div class="empty" id="list-empty" hidden></div>
+
+      <div class="selbar" id="selbar" hidden>
+        <div class="selbar-text" id="selbar-text"></div>
+        <div class="selbar-actions">
+          <button class="btn" data-act="download" type="button"><span data-icon="download"></span>Скачать</button>
+          <button class="btn primary" data-act="download-upload" type="button"><span data-icon="sync"></span>Скачать и в ЯМ</button>
+          <button class="btn" data-act="upload" type="button"><span data-icon="upload"></span>Загрузить в ЯМ</button>
+          <button class="btn" data-act="mark" type="button"><span data-icon="check"></span>Уже в ЯМ</button>
+          <button class="btn" data-act="unmark" type="button">Снять «В ЯМ»</button>
+          <button class="icon-btn" data-act="clear" type="button" title="Снять выбор (Esc)" aria-label="Снять выбор" data-icon="x"></button>
+        </div>
+      </div>
+    </section>
+
+    <section class="view scroll" id="view-report" aria-label="Сверка с Яндекс Музыкой" hidden></section>
+    <section class="view scroll" id="view-history" aria-label="История" hidden></section>
+    <section class="view scroll" id="view-settings" aria-label="Настройки" hidden></section>
+  </main>
+
+  <footer class="player" id="player" hidden>
+    <div class="player-controls">
+      <button class="icon-btn" id="pl-prev" type="button" aria-label="Предыдущий" data-icon="prev"></button>
+      <button class="icon-btn big" id="pl-play" type="button" aria-label="Играть" data-icon="play"></button>
+      <button class="icon-btn" id="pl-next" type="button" aria-label="Следующий" data-icon="next"></button>
+    </div>
+    <div class="player-meta">
+      <div class="art small" id="pl-art"></div>
+      <div class="player-text"><div class="title" id="pl-title"></div><div class="artist" id="pl-artist"></div></div>
+    </div>
+    <div class="player-seek">
+      <span class="time" id="pl-cur">0:00</span>
+      <input type="range" id="pl-seek" min="0" max="1000" value="0" aria-label="Позиция">
+      <span class="time" id="pl-dur">0:00</span>
+    </div>
+    <button class="icon-btn" id="pl-close" type="button" aria-label="Закрыть плеер" data-icon="x"></button>
+    <audio id="audio" preload="metadata"></audio>
+  </footer>
+</div>
+
+<div class="onboarding" id="onboarding" hidden></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="menu" id="menu" role="menu" hidden></div>
+<dialog class="alert" id="dialog">
+  <form method="dialog">
+    <div class="alert-icon" data-icon="music"></div>
+    <h2 id="dialog-title"></h2>
+    <p id="dialog-text"></p>
+    <div class="alert-buttons">
+      <button class="btn" value="cancel" id="dialog-cancel">Отмена</button>
+      <button class="btn primary" value="ok" id="dialog-ok">OK</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

@@ -1,32 +1,46 @@
 #!/usr/bin/env python3
-"""Web interface for Музыкальный — SoundCloud ↔ Яндекс Музыка."""
+"""Музыкальный — локальный веб-сервер: лайки SoundCloud → плейлист Яндекс Музыки.
+
+Интерфейс — templates/index.html + static/ (ES-модули без сборки).
+Контракты: specs/openapi.yaml (REST), specs/sse-events.md (события /api/progress).
+"""
 
 from __future__ import annotations
 
 import csv
 import json
+import mimetypes
 import queue
 import re
 import subprocess
 import threading
 import time
+import uuid
 import webbrowser
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yaml
 import yt_dlp
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 from yt_dlp.postprocessor.metadataparser import MetadataParserPP
 
-# ── Paths ────────────────────────────────────────────────────────────────
+# ── Paths & constants ────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 TRACKS_PATH = BASE_DIR / "tracks.csv"
 TRACKS_JSON_PATH = BASE_DIR / "tracks.json"
 ARCHIVE_PATH = BASE_DIR / "archive.txt"
-CSV_FIELDS = ["sc_id", "title", "artist", "sc_url", "status", "file", "added"]
+HISTORY_PATH = BASE_DIR / "history.json"
+STATIC_DIR = BASE_DIR / "static"
+PORT = 5555
+
+CSV_FIELDS = ["sc_id", "title", "artist", "sc_url", "status", "file", "added", "error"]
+# pending → downloaded → uploaded; not_in_likes — пропал из лайков; unavailable — скачать нельзя
+STATUSES = ("pending", "downloaded", "uploaded", "not_in_likes", "unavailable")
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac"}
+AUDIO_MIME = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".opus": "audio/ogg", ".flac": "audio/flac"}
 # Незавершённые скачивания yt-dlp (после отмены/сбоя) — подчищаем.
 PARTIAL_GLOBS = ("*.part", "*.part-Frag*", "*.ytdl")
 # Некоторые заливают трек с названием «… .mp3» — без этого получаются «….mp3.mp3».
@@ -36,10 +50,33 @@ TITLE_EXT_CLEANUP_PP = {
     "actions": [(MetadataParserPP.Actions.REPLACE, "title",
                  r"(?i)\.(?:mp3|wav|flac|m4a|aiff?|ogg|opus)$", "")],
 }
+# Ошибки, после которых повторять скачивание бессмысленно → статус unavailable.
+UNAVAILABLE_PATTERNS = (
+    ("DRM protected", "Защищён DRM (SoundCloud Go+) — скачать нельзя"),
+    ("not available in your country", "Недоступен в вашей стране"),
+    ("geo restriction", "Недоступен в вашей стране"),
+    ("HTTP Error 404", "Удалён или скрыт автором"),
+    ("HTTP Error 410", "Удалён автором"),
+)
 
-app = Flask(__name__)
+FORMATS = ("mp3", "m4a", "opus", "flac")
+QUALITIES = ("128", "192", "256", "320")
+COOKIE_BROWSERS = ("", "chrome", "safari", "firefox", "brave", "edge", "chromium", "opera", "vivaldi")
+AUTOSYNC_INTERVALS = (1, 3, 6, 12, 24)
+TASK_TITLES = {"scan": "Проверка лайков", "download": "Скачивание",
+               "upload": "Загрузка в ЯМ", "sync": "Синхронизация"}
 
-_ALLOWED_HOSTS = {"127.0.0.1:5555", "localhost:5555", "127.0.0.1", "localhost"}
+HISTORY_LIMIT = 50
+HISTORY_EVENTS_LIMIT = 300
+AUTH_CACHE_TTL = 600  # сек: не читать cookies Chrome на каждое открытие страницы
+
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+
+app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(STATIC_DIR))
+# ES-модули импортируют друг друга без ?v= — пусть браузер всегда перепроверяет статику (304).
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
+_ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}", "127.0.0.1", "localhost"}
 
 
 @app.before_request
@@ -52,6 +89,7 @@ def _csrf_guard():
         if origin and urlparse(origin).netloc.lower() not in _ALLOWED_HOSTS:
             return jsonify({"error": "Кросс-доменный запрос отклонён"}), 403
 
+
 # ── Shared state ─────────────────────────────────────────────────────────
 _clients: list[queue.Queue] = []
 _clients_lock = threading.Lock()
@@ -59,13 +97,32 @@ _task_lock = threading.Lock()
 # RLock: держим его на весь цикл «прочитал → изменил → записал», при этом
 # _load_tracks/_save_tracks могут брать его повторно из того же потока.
 _db_lock = threading.RLock()
+_history_lock = threading.Lock()
 _active_task: str | None = None
+_task_trigger: str | None = None
+_task_started_at: float | None = None
 # Поток текущей задачи: пока он жив, новую задачу не запускаем — иначе
 # _cancel.clear() «оживит» недоостановленный воркер и два потока пишут в CSV.
 _worker: threading.Thread | None = None
 _cancel = threading.Event()
+# Запись истории текущей задачи — в неё _broadcast складывает события.
+_current_rec: dict | None = None
 # None = ещё не проверяли; False = браузер/профиль не найден, cookies не используем
 _browser_cookies_ok: bool | None = None
+_auth_cache: dict | None = None
+_last_report: dict | None = None
+
+
+class TaskError(Exception):
+    """Задача не может продолжаться; текст — для пользователя."""
+
+
+class TaskCancelled(Exception):
+    """Пользователь нажал «Остановить»; counts — что успели сделать."""
+
+    def __init__(self, counts: dict | None = None):
+        super().__init__("Отменено")
+        self.counts = counts or {}
 
 
 def _is_cookie_db_error(err: str) -> bool:
@@ -77,7 +134,12 @@ def _norm(s: str | None) -> str:
     return " ".join((s or "").lower().replace("ё", "е").split())
 
 
-# ── Config helpers ───────────────────────────────────────────────────────
+def _check_cancel(counts: dict | None = None) -> None:
+    if _cancel.is_set():
+        raise TaskCancelled(counts)
+
+
+# ── Config & settings ────────────────────────────────────────────────────
 
 def _load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -87,25 +149,149 @@ def _load_config() -> dict:
 
 
 def _save_config(cfg: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    tmp.replace(CONFIG_PATH)
 
 
 def _music_dir(cfg: dict | None = None) -> Path:
     """Папка музыки. Относительный путь из конфига — от папки проекта, а не от cwd."""
     if cfg is None:
         cfg = _load_config()
-    p = Path(cfg.get("output", {}).get("directory", "./Music")).expanduser()
+    p = Path((cfg.get("output") or {}).get("directory", "./Music")).expanduser()
     return (p if p.is_absolute() else BASE_DIR / p).resolve()
 
 
 def _profile_url(value: str) -> str:
     """Имя или любая ссылка на профиль SoundCloud → URL страницы лайков."""
-    v = value.strip()
-    m = re.search(r"soundcloud\.com/([^/?#\s]+)", v)
-    user = m.group(1) if m else v.strip("/@ ")
-    return f"https://soundcloud.com/{user}/likes"
+    return f"https://soundcloud.com/{_sc_username(value)}/likes"
 
+
+def _sc_username(value: str) -> str:
+    v = (value or "").strip()
+    m = re.search(r"soundcloud\.com/([^/?#\s]+)", v)
+    return m.group(1) if m else v.strip("/@ ")
+
+
+def _extract_username(profile_url: str) -> str:
+    if not profile_url:
+        return ""
+    user = _sc_username(profile_url)
+    return "" if user == "YOUR_USERNAME" else user
+
+
+def _settings(cfg: dict | None = None) -> dict:
+    """Настройки в том виде, в каком их видит интерфейс (с умолчаниями)."""
+    cfg = _load_config() if cfg is None else cfg
+    sc = cfg.get("soundcloud") or {}
+    out = cfg.get("output") or {}
+    ym = cfg.get("yandex_music") or {}
+    au = cfg.get("autosync") or {}
+    username = _extract_username(sc.get("profile_url", ""))
+    return {
+        "soundcloud": {
+            "username": username,
+            "profile_url": _profile_url(username) if username else "",
+            "max_tracks": int(sc.get("max_tracks") or 0),
+            "sleep_requests": float(sc.get("sleep_requests", 1.5)),
+            "cookies_browser": sc.get("cookies_browser") or "",
+        },
+        "output": {
+            "directory": str(out.get("directory", "./Music")),
+            "resolved_directory": str(_music_dir(cfg)),
+            "format": str(out.get("format", "mp3")),
+            "quality": str(out.get("quality", "320")),
+        },
+        "yandex_music": {
+            "playlist_url": ym.get("playlist_url") or "",
+            "upload_delay": float(ym.get("upload_delay", 3)),
+            "delete_after_upload": bool(ym.get("delete_after_upload", False)),
+        },
+        "autosync": {
+            "enabled": bool(au.get("enabled", False)),
+            "interval_hours": int(au.get("interval_hours", 6)),
+            "download": bool(au.get("download", True)),
+            "upload": bool(au.get("upload", True)),
+            "notify": bool(au.get("notify", True)),
+        },
+    }
+
+
+def _apply_settings(cfg: dict, data: dict) -> dict:
+    """Проверяет частичное обновление настроек и применяет его к cfg.
+    Ошибка → ValueError(поле, текст): не записываем ничего."""
+
+    def num(section: str, key: str, value, lo: float, hi: float, cast=float):
+        try:
+            v = cast(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{section}.{key}", "Нужно число") from None
+        if not lo <= v <= hi:
+            raise ValueError(f"{section}.{key}", f"Допустимо от {lo:g} до {hi:g}")
+        return v
+
+    def choice(section: str, key: str, value, allowed):
+        v = str(value)
+        if v not in allowed:
+            raise ValueError(f"{section}.{key}", "Недопустимое значение")
+        return v
+
+    sc_in = data.get("soundcloud") or {}
+    sc = cfg.setdefault("soundcloud", {})
+    if "username" in sc_in:
+        user = _sc_username(str(sc_in["username"] or ""))
+        sc["profile_url"] = _profile_url(user) if user else ""
+    if "max_tracks" in sc_in:
+        sc["max_tracks"] = num("soundcloud", "max_tracks", sc_in["max_tracks"], 0, 100000, int)
+    if "sleep_requests" in sc_in:
+        sc["sleep_requests"] = num("soundcloud", "sleep_requests", sc_in["sleep_requests"], 0, 30)
+    if "cookies_browser" in sc_in:
+        cb = choice("soundcloud", "cookies_browser", sc_in["cookies_browser"] or "", COOKIE_BROWSERS)
+        if cb:
+            sc["cookies_browser"] = cb
+        else:
+            sc.pop("cookies_browser", None)
+
+    out_in = data.get("output") or {}
+    out = cfg.setdefault("output", {})
+    if "directory" in out_in:
+        d = str(out_in["directory"] or "").strip()
+        if not d:
+            raise ValueError("output.directory", "Укажите папку")
+        out["directory"] = d
+    if "format" in out_in:
+        out["format"] = choice("output", "format", out_in["format"], FORMATS)
+    if "quality" in out_in:
+        out["quality"] = choice("output", "quality", out_in["quality"], QUALITIES)
+
+    ym_in = data.get("yandex_music") or {}
+    ym = cfg.setdefault("yandex_music", {})
+    if "playlist_url" in ym_in:
+        url = str(ym_in["playlist_url"] or "").strip()
+        if url and not re.match(r"https://music\.yandex\.[a-z]{2,3}/", url):
+            raise ValueError("yandex_music.playlist_url", "Нужна ссылка вида https://music.yandex.ru/…")
+        ym["playlist_url"] = url
+    if "upload_delay" in ym_in:
+        ym["upload_delay"] = num("yandex_music", "upload_delay", ym_in["upload_delay"], 0, 60)
+    if "delete_after_upload" in ym_in:
+        ym["delete_after_upload"] = bool(ym_in["delete_after_upload"])
+
+    au_in = data.get("autosync") or {}
+    if au_in:
+        au = cfg.setdefault("autosync", {})
+        for key in ("enabled", "download", "upload", "notify"):
+            if key in au_in:
+                au[key] = bool(au_in[key])
+        if "interval_hours" in au_in:
+            v = num("autosync", "interval_hours", au_in["interval_hours"], 1, 24, int)
+            if v not in AUTOSYNC_INTERVALS:
+                raise ValueError("autosync.interval_hours", "Недопустимый интервал")
+            au["interval_hours"] = v
+    return cfg
+
+
+# ── Files helpers ────────────────────────────────────────────────────────
 
 def _abs_file(stored: str | None) -> str | None:
     """Путь из CSV → абсолютный. В CSV храним относительно папки проекта,
@@ -146,10 +332,32 @@ def _cleanup_partials(music_dir: Path | None = None) -> None:
             (music_dir / f"{stem}{ext}").unlink(missing_ok=True)
 
 
+def _delete_file_safe(filepath: str | None) -> None:
+    if not filepath:
+        return
+    p = Path(filepath)
+    if p.exists():
+        p.unlink(missing_ok=True)
+    music_dir = _music_dir()
+    try:
+        parent = p.parent.resolve()
+        # Подчищаем только пустые подпапки ВНУТРИ папки музыки — иначе при
+        # смене output.directory цикл ушёл бы удалять папки вверх до корня.
+        while (
+            parent != music_dir
+            and parent.is_relative_to(music_dir)
+            and parent.exists()
+            and not any(parent.iterdir())
+        ):
+            parent.rmdir()
+            parent = parent.parent
+    except OSError:
+        pass
+
+
 # ── Tracks DB (CSV) ──────────────────────────────────────────────────────
 # Key = SoundCloud numeric ID (str).
-# Value = {title, artist, sc_url, status, file, added}
-# status: "pending" | "downloaded" | "uploaded" | "not_in_likes" (нет в текущем списке лайков SC)
+# Value = {title, artist, sc_url, status, file, added, error}
 
 def _load_tracks() -> dict:
     # Ошибку чтения не глотаем: вернуть {} значило бы, что следующий
@@ -164,12 +372,13 @@ def _load_tracks() -> dict:
                 if not sc_id:
                     continue
                 result[sc_id] = {
-                    "title": row.get("title", ""),
-                    "artist": row.get("artist", ""),
-                    "sc_url": row.get("sc_url", ""),
-                    "status": row.get("status", "pending"),
+                    "title": row.get("title") or "",
+                    "artist": row.get("artist") or "",
+                    "sc_url": row.get("sc_url") or "",
+                    "status": row.get("status") or "pending",
                     "file": _abs_file(row.get("file")),
-                    "added": row.get("added", ""),
+                    "added": row.get("added") or "",
+                    "error": row.get("error") or "",
                 }
         return result
 
@@ -187,13 +396,28 @@ def _save_tracks(data: dict) -> None:
         tmp.replace(TRACKS_PATH)
 
 
-def _track_update(sc_id: str, **fields) -> None:
+def _track_update(sc_id: str, **fields) -> dict:
     with _db_lock:
         tracks = _load_tracks()
         entry = tracks.get(sc_id, {})
         entry.update({k: v for k, v in fields.items() if v is not None})
         tracks[sc_id] = entry
         _save_tracks(tracks)
+        return entry
+
+
+def _track_view(sc_id: str, info: dict) -> dict:
+    f = info.get("file")
+    return {
+        "id": sc_id,
+        "title": info.get("title") or sc_id,
+        "artist": info.get("artist") or "",
+        "status": info.get("status") or "pending",
+        "added": info.get("added") or "",
+        "error": info.get("error") or "",
+        "has_file": bool(f and Path(f).exists()),
+        "sc_url": info.get("sc_url") or "",
+    }
 
 
 def _migrate_json_to_csv() -> None:
@@ -253,7 +477,7 @@ def _sync_archive() -> None:
             key = f"soundcloud {sc_id}"
             if info.get("status") in ("downloaded", "uploaded"):
                 existing.add(key)
-            elif key in existing and info.get("status") in ("pending", "not_in_likes"):
+            elif key in existing and info.get("status") in ("pending", "not_in_likes", "unavailable"):
                 fpath = info.get("file")
                 if fpath and Path(fpath).exists():
                     tracks[sc_id]["status"] = "downloaded"
@@ -283,32 +507,37 @@ def _remove_from_archive(sc_id: str) -> None:
         )
 
 
-def _delete_file_safe(filepath: str | None) -> None:
-    if not filepath:
-        return
-    p = Path(filepath)
-    if p.exists():
-        p.unlink(missing_ok=True)
+def _music_stats() -> dict:
+    tracks = _load_tracks()
+    by_status = Counter(t.get("status") or "pending" for t in tracks.values())
     music_dir = _music_dir()
-    try:
-        parent = p.parent.resolve()
-        # Подчищаем только пустые подпапки ВНУТРИ папки музыки — иначе при
-        # смене output.directory цикл ушёл бы удалять папки вверх до корня.
-        while (
-            parent != music_dir
-            and parent.is_relative_to(music_dir)
-            and parent.exists()
-            and not any(parent.iterdir())
-        ):
-            parent.rmdir()
-            parent = parent.parent
-    except OSError:
-        pass
+    size = 0
+    local_files = 0
+    if music_dir.exists():
+        for f in music_dir.rglob("*"):
+            if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
+                size += f.stat().st_size
+                local_files += 1
+    return {
+        "total": len(tracks),
+        **{s: by_status.get(s, 0) for s in STATUSES},
+        "not_in_ym": len(tracks) - by_status.get("uploaded", 0),
+        "with_errors": sum(1 for t in tracks.values()
+                           if t.get("error") and t.get("status") != "unavailable"),
+        "local_files": local_files,
+        "size_mb": round(size / (1024 * 1024), 1),
+    }
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
+# ── Events & history ─────────────────────────────────────────────────────
+_SKIP_IN_HISTORY = {"downloading", "uploading", "ping", "hello", "scan_progress"}
+
 
 def _broadcast(event: dict) -> None:
+    rec = _current_rec
+    if rec is not None and event.get("type") not in _SKIP_IN_HISTORY:
+        if len(rec["events"]) < HISTORY_EVENTS_LIMIT:
+            rec["events"].append({**event, "t": round(time.time(), 1)})
     data = json.dumps(event, ensure_ascii=False)
     with _clients_lock:
         dead: list[queue.Queue] = []
@@ -321,62 +550,132 @@ def _broadcast(event: dict) -> None:
             _clients.remove(q)
 
 
-def _music_stats() -> dict:
-    tracks = _load_tracks()
-    total = len(tracks)
-    uploaded = sum(1 for t in tracks.values() if t.get("status") == "uploaded")
-    downloaded = sum(1 for t in tracks.values() if t.get("status") == "downloaded")
-    pending = sum(1 for t in tracks.values() if t.get("status") == "pending")
-    not_in_likes = sum(1 for t in tracks.values() if t.get("status") == "not_in_likes")
-    music_dir = _music_dir()
-    size = 0
-    local_files = 0
-    if music_dir.exists():
-        for f in music_dir.rglob("*"):
-            if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
-                size += f.stat().st_size
-                local_files += 1
-    return {
-        "total": total,
-        "uploaded": uploaded,
-        "downloaded": downloaded,
-        "pending": pending,
-        "not_in_likes": not_in_likes,
-        "local_files": local_files,
-        "size_mb": round(size / (1024 * 1024), 1),
-    }
+def _load_history() -> list[dict]:
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            items = json.load(f)
+        return items if isinstance(items, list) else []
+    except (OSError, ValueError):
+        return []
 
 
-def _extract_username(profile_url: str) -> str:
-    if not profile_url:
-        return ""
-    parts = profile_url.rstrip("/").split("/")
-    for i, p in enumerate(parts):
-        if "soundcloud.com" in p and i + 1 < len(parts):
-            return parts[i + 1]
-    return profile_url
+def _append_history(rec: dict) -> None:
+    with _history_lock:
+        items = [rec, *_load_history()][:HISTORY_LIMIT]
+        tmp = HISTORY_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+        tmp.replace(HISTORY_PATH)
 
+
+def _notify(title: str, text: str) -> None:
+    """Уведомление macOS (Центр уведомлений) через osascript."""
+    script = (f"display notification {json.dumps(text, ensure_ascii=False)} "
+              f"with title {json.dumps(title, ensure_ascii=False)}")
+    try:
+        subprocess.run(["osascript", "-e", script], timeout=5, check=False,
+                       capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _notify_autosync(rec: dict) -> None:
+    if not _settings()["autosync"]["notify"]:
+        return
+    s = rec.get("summary") or {}
+    if rec["status"] == "error":
+        _notify("Музыкальный", f"Автосинхронизация: ошибка — {s.get('message', '')[:120]}")
+        return
+    parts = []
+    if s.get("new_count"):
+        parts.append(f"новых лайков: {s['new_count']}")
+    if s.get("downloaded"):
+        parts.append(f"скачано: {s['downloaded']}")
+    if s.get("uploaded"):
+        parts.append(f"в ЯМ: {s['uploaded']}")
+    errors = (s.get("failures") or 0) + (s.get("upload_errors") or 0)
+    if errors:
+        parts.append(f"ошибок: {errors}")
+    if parts:
+        _notify("Музыкальный", "Автосинхронизация — " + ", ".join(parts))
+
+
+# ── Task runner ──────────────────────────────────────────────────────────
 
 def _set_task(name: str | None) -> None:
-    global _active_task
+    global _active_task, _task_trigger, _task_started_at
     with _task_lock:
         _active_task = name
+        if name is None:
+            _task_trigger = None
+            _task_started_at = None
 
 
-def _start_task(name: str, target, *args) -> str | None:
+def _start_task(name: str, fn, *args, trigger: str = "manual") -> str | None:
     """Запускает фоновую задачу. Возвращает текст ошибки, если что-то уже выполняется
     (в т.ч. если прошлый воркер ещё не доостановился после «Остановить»)."""
-    global _active_task, _worker
+    global _active_task, _task_trigger, _task_started_at, _worker
     with _task_lock:
         if _active_task:
-            return f"Уже выполняется: {_active_task}"
+            return f"Уже выполняется: {TASK_TITLES.get(_active_task, _active_task)}"
         if _worker is not None and _worker.is_alive():
-            return "Предыдущая задача ещё останавливается — подождите пару секунд"
+            # active_task уже сброшен — воркер дописывает историю; ждём его недолго.
+            _worker.join(timeout=3)
+            if _worker.is_alive():
+                return "Предыдущая задача ещё останавливается — подождите пару секунд"
         _active_task = name
+        _task_trigger = trigger
+        _task_started_at = time.time()
         _cancel.clear()
-        _worker = threading.Thread(target=target, args=args, daemon=True)
+        _worker = threading.Thread(target=_run_task, args=(name, trigger, fn, args),
+                                   daemon=True, name=f"task-{name}")
         _worker.start()
     return None
+
+
+def _run_task(name: str, trigger: str, fn, args: tuple) -> None:
+    """Обёртка задачи: события task_start/task_end, отмена, ошибки, запись в историю."""
+    global _current_rec
+    rec = {"id": uuid.uuid4().hex[:12], "task": name, "trigger": trigger,
+           "started_at": time.time(), "finished_at": None,
+           "status": "ok", "summary": {}, "events": []}
+    _current_rec = rec
+    _broadcast({"type": "task_start", "task": name, "trigger": trigger})
+    try:
+        summary = fn(*args) or {}
+        rec["summary"] = summary
+        if summary.get("level") in ("error", "warn"):
+            rec["status"] = summary["level"]
+    except TaskCancelled as c:
+        rec["status"] = "cancelled"
+        rec["summary"] = c.counts
+        _broadcast({"type": "cancelled", **c.counts})
+    except TaskError as e:
+        rec["status"] = "error"
+        rec["summary"] = {"message": str(e)}
+        _broadcast({"type": "error", "message": str(e)})
+    except Exception as e:
+        msg = f"{e!s:.300}"
+        rec["status"] = "error"
+        rec["summary"] = {"message": msg}
+        _broadcast({"type": "error", "message": msg})
+    finally:
+        try:
+            _cleanup_partials()
+        except OSError:
+            pass
+        rec["finished_at"] = time.time()
+        _current_rec = None
+        try:
+            _append_history(rec)
+        except OSError:
+            pass
+        _set_task(None)
+        _broadcast({"type": "task_end", "task": name, "status": rec["status"],
+                    "history_id": rec["id"]})
+        if trigger == "auto":
+            # Отдельным потоком: osascript не должен задерживать завершение задачи.
+            threading.Thread(target=_notify_autosync, args=(rec,), daemon=True).start()
 
 
 class _SilentLogger:
@@ -386,294 +685,281 @@ class _SilentLogger:
     def error(self, msg: str) -> None: pass
 
 
-# ── Scan worker ──────────────────────────────────────────────────────────
+# ── SoundCloud: scan ─────────────────────────────────────────────────────
 
-def _scan_worker(config: dict) -> None:
+def _fetch_likes(sc: dict, url: str, max_tracks: int) -> list[dict]:
+    """Лайки SoundCloud постранично (по 200): прогресс и отмена между страницами."""
     global _browser_cookies_ok
-    try:
-        sc = config.get("soundcloud", {})
-        target_url = sc.get("profile_url", "")
-        if not target_url:
-            _broadcast({"type": "error", "message": "URL профиля не задан"})
-            return
+    opts: dict = {"quiet": True, "no_color": True, "skip_download": True,
+                  "logger": _SilentLogger()}
+    cookies_browser = sc.get("cookies_browser")
+    if cookies_browser and _browser_cookies_ok is not False:
+        opts["cookiesfrombrowser"] = (cookies_browser,)
 
-        _broadcast({"type": "scanning"})
-
-        flat_opts: dict = {
-            "format": "bestaudio/best",
-            "extract_flat": True,
-            "skip_download": True,
-            "quiet": True,
-            "no_color": True,
-            "logger": _SilentLogger(),
-        }
-        cookies_browser = sc.get("cookies_browser")
-        if cookies_browser and _browser_cookies_ok is not False:
-            flat_opts["cookiesfrombrowser"] = (cookies_browser,)
-
-        max_tracks = sc.get("max_tracks", 0)
-        if max_tracks and max_tracks > 0:
-            flat_opts["playlistend"] = max_tracks
-
-        def _flat_extract() -> list[dict]:
-            with yt_dlp.YoutubeDL(flat_opts) as ydl:
-                info = ydl.extract_info(target_url, download=False)
-                if info and "entries" in info:
-                    return [e for e in info["entries"] if e]
-            return []
-
+    def run() -> list[dict]:
         entries: list[dict] = []
-        try:
-            entries = _flat_extract()
-        except Exception as e:
-            # Браузер не установлен / профиль не найден — пробуем без cookies:
-            # для публичных лайков они и не нужны.
-            if _is_cookie_db_error(str(e)) and "cookiesfrombrowser" in flat_opts:
-                _browser_cookies_ok = False
-                flat_opts.pop("cookiesfrombrowser", None)
-                _broadcast({"type": "log", "level": "warn", "message":
-                            f"Cookies браузера «{cookies_browser}» недоступны "
-                            "(браузер не установлен?) — сканирую без них"})
-                try:
-                    entries = _flat_extract()
-                except Exception as e2:
-                    _broadcast({"type": "error", "message": f"Ошибка сканирования: {e2!s:.200}"})
-                    return
-            else:
-                _broadcast({"type": "error", "message": f"Ошибка сканирования: {e!s:.200}"})
-                return
-
-        if not entries:
-            # Пустой ответ без исключения (сбой SoundCloud, опечатка в имени) не должен
-            # переводить все ожидающие треки в «пропал из лайков».
-            _broadcast({"type": "error", "message":
-                        "SoundCloud вернул пустой список лайков — статусы не изменены. "
-                        "Проверьте имя пользователя и повторите."})
-            return
-
-        with _db_lock:
-            tracks = _load_tracks()
-            new_entries: list[dict] = []
-            first_seen_count = 0
-            for e in entries:
-                sc_id = str(e.get("id", ""))
-                if not sc_id:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False, process=False)
+            for e in (info or {}).get("entries") or []:
+                _check_cancel()
+                if not e or not e.get("id"):
                     continue
-                prev = tracks.get(sc_id)
-                sc_url = e.get("url") or e.get("webpage_url") or (prev or {}).get("sc_url", "")
-                if prev and prev.get("status") in ("downloaded", "uploaded"):
-                    if not prev.get("title"):
-                        prev.update(
-                            title=e.get("title") or "",
-                            artist=e.get("uploader") or prev.get("artist", ""),
-                            sc_url=sc_url,
-                        )
-                else:
-                    new_entries.append(e)
-                    if prev is None:
-                        first_seen_count += 1
-                    # Плоский скан не отдаёт исполнителя — не затираем уже известного.
-                    tracks[sc_id] = {
-                        "title": e.get("title") or (prev or {}).get("title", ""),
-                        "artist": e.get("uploader") or (prev or {}).get("artist", ""),
-                        "sc_url": sc_url,
-                        "status": "pending",
-                        "file": (prev or {}).get("file"),
-                        "added": (prev or {}).get("added") or time.strftime("%Y-%m-%d"),
-                    }
-            not_in_likes_n = 0
-            # С лимитом max_tracks список неполный — «пропавшие» за лимитом не пропали.
-            if not (max_tracks and max_tracks > 0):
-                seen_ids = {str(e.get("id", "")) for e in entries}
-                for sid, info in tracks.items():
-                    if info.get("status") == "pending" and sid not in seen_ids and not info.get("file"):
-                        info["status"] = "not_in_likes"
-                        not_in_likes_n += 1
+                entries.append(e)
+                if len(entries) % 50 == 0:
+                    _broadcast({"type": "scan_progress", "found": len(entries)})
+                if max_tracks and len(entries) >= max_tracks:
+                    break
+        _broadcast({"type": "scan_progress", "found": len(entries)})
+        return entries
 
-            _save_tracks(tracks)
-
-        all_display = []
-        for e in entries:
-            sc_id = str(e.get("id", ""))
-            if not sc_id:
-                continue
-            info = tracks.get(sc_id, {})
-            all_display.append({
-                "id": sc_id,
-                "title": info.get("title") or e.get("title") or sc_id,
-                "artist": info.get("artist") or e.get("uploader") or "",
-                "status": info.get("status", "pending"),
-            })
-        # Треки из базы, которых уже нет в лайках (в т.ч. загруженные в ЯМ),
-        # не должны пропадать из списка после скана.
-        shown = {t["id"] for t in all_display}
-        for sid, info in reversed(list(tracks.items())):
-            if sid not in shown:
-                all_display.append({
-                    "id": sid,
-                    "title": info.get("title", "") or sid,
-                    "artist": info.get("artist", ""),
-                    "status": info.get("status", "pending"),
-                })
-
-        _broadcast({
-            "type": "scan_complete",
-            "total": len(entries),
-            "new_count": first_seen_count,
-            "already": len(entries) - len(new_entries),
-            "not_in_likes": not_in_likes_n,
-            "all_tracks": all_display,
-        })
-
+    try:
+        return run()
+    except TaskCancelled:
+        raise
     except Exception as e:
-        _broadcast({"type": "error", "message": str(e)[:300]})
-    finally:
-        _set_task(None)
+        # Браузер не установлен / профиль не найден — пробуем без cookies:
+        # для публичных лайков они и не нужны.
+        if _is_cookie_db_error(str(e)) and "cookiesfrombrowser" in opts:
+            _browser_cookies_ok = False
+            opts.pop("cookiesfrombrowser", None)
+            _broadcast({"type": "log", "level": "warn", "message":
+                        f"Cookies браузера «{cookies_browser}» недоступны — проверяю без них"})
+            try:
+                return run()
+            except TaskCancelled:
+                raise
+            except Exception as e2:
+                raise TaskError(f"Ошибка проверки лайков: {e2!s:.200}") from e2
+        if "404" in str(e):
+            raise TaskError("Профиль SoundCloud не найден — проверьте имя в настройках") from e
+        raise TaskError(f"Ошибка проверки лайков: {e!s:.200}") from e
 
 
-# ── Pipeline worker: download → upload ───────────────────────────────────
+def _do_scan(config: dict) -> dict:
+    sc = config.get("soundcloud") or {}
+    username = _extract_username(sc.get("profile_url", ""))
+    if not username:
+        raise TaskError("Профиль SoundCloud не задан — укажите его в настройках")
+    _broadcast({"type": "scanning"})
+    max_tracks = int(sc.get("max_tracks") or 0)
+    entries = _fetch_likes(sc, _profile_url(username), max_tracks)
+    if not entries:
+        # Пустой ответ без исключения (сбой SoundCloud, опечатка в имени) не должен
+        # переводить все ожидающие треки в «пропал из лайков».
+        raise TaskError("SoundCloud вернул пустой список лайков — статусы не изменены. "
+                        "Проверьте имя пользователя и повторите.")
 
-def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | None = None) -> None:
-    """Скачивает треки из локальной базы (tracks.csv) и, если нужно, грузит в ЯМ.
+    with _db_lock:
+        tracks = _load_tracks()
+        new_count = 0
+        known = 0
+        for e in entries:
+            sc_id = str(e.get("id"))
+            prev = tracks.get(sc_id)
+            sc_url = e.get("url") or e.get("webpage_url") or (prev or {}).get("sc_url", "")
+            if prev and prev.get("status") in ("downloaded", "uploaded", "unavailable"):
+                known += 1
+                if not prev.get("title"):
+                    prev["title"] = e.get("title") or ""
+                if not prev.get("sc_url"):
+                    prev["sc_url"] = sc_url
+                continue
+            if prev is None:
+                new_count += 1
+            else:
+                known += 1
+            # Плоский скан не отдаёт исполнителя — не затираем уже известного.
+            tracks[sc_id] = {
+                "title": e.get("title") or (prev or {}).get("title", ""),
+                "artist": (prev or {}).get("artist", ""),
+                "sc_url": sc_url,
+                "status": "pending",
+                "file": (prev or {}).get("file"),
+                "added": (prev or {}).get("added") or time.strftime("%Y-%m-%d"),
+                "error": (prev or {}).get("error", ""),
+            }
+        not_in_likes_n = 0
+        # С лимитом max_tracks список неполный — «пропавшие» за лимитом не пропали.
+        if not max_tracks:
+            seen_ids = {str(e.get("id")) for e in entries}
+            for sid, info in tracks.items():
+                if info.get("status") == "pending" and sid not in seen_ids and not info.get("file"):
+                    info["status"] = "not_in_likes"
+                    not_in_likes_n += 1
+        _save_tracks(tracks)
+
+    summary = {"total": len(entries), "new_count": new_count,
+               "already": known, "not_in_likes": not_in_likes_n}
+    _broadcast({"type": "scan_complete", **summary})
+    return summary
+
+
+# ── SoundCloud: download ─────────────────────────────────────────────────
+
+def _unavailable_reason(message: str) -> str | None:
+    for pattern, reason in UNAVAILABLE_PATTERNS:
+        if pattern.lower() in message.lower():
+            return reason
+    return None
+
+
+def _do_download(config: dict, track_ids: list | None) -> dict:
+    """Скачивает треки из локальной базы (tracks.csv) по sc_url.
 
     Работает по базе, а не по результату последнего скана: после перезапуска
     приложения скачивание доступно сразу. track_ids=None — все «pending».
     """
     global _browser_cookies_ok
-    ydl = None
-    try:
-        sc = config.get("soundcloud", {})
-        out = config.get("output", {})
+    sc = config.get("soundcloud") or {}
+    out = config.get("output") or {}
 
-        output_dir = _music_dir(config)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        audio_fmt = out.get("format", "mp3")
-        quality = out.get("quality", "320")
-        template = str(output_dir / "%(uploader)s - %(title)s.%(ext)s")
+    output_dir = _music_dir(config)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audio_fmt = out.get("format", "mp3")
+    quality = str(out.get("quality", "320"))
+    template = str(output_dir / "%(uploader)s - %(title)s.%(ext)s")
 
-        existing_tracks = _load_tracks()
-        if track_ids is None:
-            selected = [sid for sid, t in existing_tracks.items() if t.get("status") == "pending"]
-        else:
-            selected = [str(tid) for tid in track_ids]
-        unknown = [sid for sid in selected if sid not in existing_tracks]
-        if unknown:
-            _broadcast({"type": "log", "level": "warn",
-                        "message": f"Нет в базе, пропущено: {len(unknown)} — обновите список лайков"})
-        selected = [sid for sid in selected if sid in existing_tracks]
-        if not selected:
-            _broadcast({"type": "error", "message": "Нет выбранных треков"})
+    existing_tracks = _load_tracks()
+    if track_ids is None:
+        selected = [sid for sid, t in existing_tracks.items() if t.get("status") == "pending"]
+    else:
+        selected = [str(tid) for tid in track_ids]
+    unknown = [sid for sid in selected if sid not in existing_tracks]
+    if unknown:
+        _broadcast({"type": "log", "level": "warn",
+                    "message": f"Нет в базе, пропущено: {len(unknown)} — обновите список лайков"})
+    selected = [sid for sid in selected if sid in existing_tracks]
+    if not selected:
+        raise TaskError("Нет выбранных треков")
+
+    total = len(selected)
+    processed = 0
+    saved_count = 0
+    errors: list[str] = []
+    failures = 0
+    last_filepath: list[str | None] = [None]
+    last_meta: list[dict] = [{}]
+    current_id: list[str | None] = [None]
+    last_emit = [0.0]
+
+    _sync_archive()
+    # yt-dlp читает archive.txt в память при создании загрузчика, поэтому id треков
+    # без файла (например, удалённых после загрузки в ЯМ) убираем заранее — иначе
+    # он молча пропустит трек, и в UI будет «не скачан» без причины.
+    for sid in selected:
+        f = existing_tracks[sid].get("file")
+        if not (f and Path(f).exists()):
+            _remove_from_archive(sid)
+    _broadcast({"type": "dl_start", "total": total})
+
+    def _short(s: str) -> str:
+        return (s[:55] + "…") if len(s) > 55 else s
+
+    def _hook(d: dict) -> None:
+        # Именно DownloadCancelled: обычный DownloadError загрузчик HLS-фрагментов
+        # глотает как сбой одного куска и идёт дальше — отмена не срабатывала.
+        if _cancel.is_set():
+            raise yt_dlp.utils.DownloadCancelled("Отменено")
+        status = d.get("status")
+        if status == "downloading":
+            now = time.monotonic()
+            if now - last_emit[0] < 0.3:
+                return  # не заливаем SSE событием на каждый чанк
+            last_emit[0] = now
+        elif status != "finished":
             return
+        # «finished» — скачан исходник, дальше ffmpeg; трек ещё НЕ готов,
+        # поэтому это тоже downloading (со stage=convert), а не track_done.
+        _broadcast({
+            "type": "downloading",
+            "id": current_id[0],
+            "title": _short(Path(d.get("filename", "")).stem),
+            "stage": "convert" if status == "finished" else "download",
+            "downloaded": processed,
+            "saved": saved_count,
+            "total": total,
+        })
 
-        total = len(selected)
-        processed = 0
-        saved_count = 0
-        errors: list[str] = []
-        download_failures: list[str] = []
-        last_filepath: list[str | None] = [None]
-        last_meta: list[dict] = [{}]
-        current_id: list[str | None] = [None]
+    def _pp_hook(d: dict) -> None:
+        if d.get("status") == "started" and _cancel.is_set():
+            raise yt_dlp.utils.DownloadCancelled("Отменено")  # не начинаем следующий шаг ffmpeg
+        if d.get("status") == "finished":
+            info = d.get("info_dict", {})
+            last_filepath[0] = info.get("filepath") or info.get("filename")
+            last_meta[0] = {"uploader": info.get("uploader", ""), "title": info.get("title", "")}
 
-        _sync_archive()
+    class _Logger:
+        _IGNORED = ("Deprecated Feature:",)
 
-        _broadcast({"type": "dl_start", "total": total})
+        def debug(self, msg: str) -> None: pass
+        def info(self, msg: str) -> None: pass
+        def warning(self, msg: str) -> None: pass
+        def error(self, msg: str) -> None:
+            if not any(p in msg for p in self._IGNORED):
+                errors.append(msg)
 
-        last_emit = [0.0]
+    dl_opts: dict = {
+        "format": "bestaudio/best",
+        "outtmpl": template,
+        "restrictfilenames": False,
+        "windowsfilenames": True,
+        "ignoreerrors": True,
+        "quiet": True,
+        "no_color": True,
+        "sleep_requests": sc.get("sleep_requests", 1.5),
+        "download_archive": str(ARCHIVE_PATH),
+        "postprocessors": [
+            TITLE_EXT_CLEANUP_PP,
+            {"key": "FFmpegExtractAudio", "preferredcodec": audio_fmt, "preferredquality": quality},
+            {"key": "FFmpegMetadata"},
+            {"key": "EmbedThumbnail"},
+        ],
+        "writethumbnail": True,
+        "embedthumbnail": True,
+        "progress_hooks": [_hook],
+        "postprocessor_hooks": [_pp_hook],
+        "logger": _Logger(),
+    }
+    cookies_browser = sc.get("cookies_browser")
+    if cookies_browser and _browser_cookies_ok is not False:
+        dl_opts["cookiesfrombrowser"] = (cookies_browser,)
 
-        def _short(s: str) -> str:
-            return (s[:55] + "…") if len(s) > 55 else s
+    def _fail(sc_id: str, prev_status: str, title: str, problem: str, raw: str) -> None:
+        """Ошибка по треку: сохраняем её; неустранимую — как статус unavailable."""
+        nonlocal failures
+        failures += 1
+        reason = _unavailable_reason(raw)
+        if reason and prev_status != "uploaded":
+            entry = _track_update(sc_id, status="unavailable", error=reason)
+            message = f"{title}: {reason}"
+        else:
+            message = f"{title}: {problem}"
+            entry = _track_update(sc_id, error=(reason or raw or problem)[:300])
+        _broadcast({"type": "log", "id": sc_id, "level": "error", "message": message})
+        _broadcast({"type": "track_status", "id": sc_id,
+                    "status": entry.get("status"), "error": entry.get("error", "")})
 
-        def _hook(d: dict) -> None:
-            # Именно DownloadCancelled: обычный DownloadError загрузчик HLS-фрагментов
-            # глотает как сбой одного куска и идёт дальше — отмена не срабатывала.
-            if _cancel.is_set():
-                raise yt_dlp.utils.DownloadCancelled("Отменено")
-            status = d.get("status")
-            if status == "downloading":
-                now = time.monotonic()
-                if now - last_emit[0] < 0.3:
-                    return  # не заливаем SSE событием на каждый чанк
-                last_emit[0] = now
-            elif status != "finished":
-                return
-            # «finished» — скачан исходник, дальше ffmpeg; трек ещё НЕ готов,
-            # поэтому это тоже downloading (со stage=convert), а не track_done.
-            _broadcast({
-                "type": "downloading",
-                "id": current_id[0],
-                "title": _short(Path(d.get("filename", "")).stem),
-                "stage": "convert" if status == "finished" else "download",
-                "downloaded": processed,
-                "saved": saved_count,
-                "total": total,
-            })
+    def _done(sc_id: str, title: str, status: str) -> None:
+        _broadcast({
+            "type": "track_done",
+            "id": sc_id,
+            "title": _short(title),
+            "status": status,
+            "downloaded": processed,
+            "saved": saved_count,
+            "total": total,
+        })
 
-        def _pp_hook(d: dict) -> None:
-            if d.get("status") == "started" and _cancel.is_set():
-                raise yt_dlp.utils.DownloadCancelled("Отменено")  # не начинаем следующий шаг ffmpeg
-            if d.get("status") == "finished":
-                info = d.get("info_dict", {})
-                last_filepath[0] = info.get("filepath") or info.get("filename")
-                last_meta[0] = {"uploader": info.get("uploader", ""), "title": info.get("title", "")}
+    def _counts() -> dict:
+        return {"downloaded": saved_count, "failures": failures}
 
-        class _Logger:
-            _IGNORED = ("Deprecated Feature:",)
-
-            def debug(self, msg: str) -> None: pass
-            def info(self, msg: str) -> None: pass
-            def warning(self, msg: str) -> None: pass
-            def error(self, msg: str) -> None:
-                if not any(p in msg for p in self._IGNORED):
-                    errors.append(msg)
-
-        dl_opts: dict = {
-            "format": "bestaudio/best",
-            "outtmpl": template,
-            "restrictfilenames": False,
-            "windowsfilenames": True,
-            "ignoreerrors": True,
-            "quiet": True,
-            "no_color": True,
-            "sleep_requests": sc.get("sleep_requests", 1.5),
-            "download_archive": str(ARCHIVE_PATH),
-            "postprocessors": [
-                TITLE_EXT_CLEANUP_PP,
-                {"key": "FFmpegExtractAudio", "preferredcodec": audio_fmt, "preferredquality": quality},
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail"},
-            ],
-            "writethumbnail": True,
-            "embedthumbnail": True,
-            "progress_hooks": [_hook],
-            "postprocessor_hooks": [_pp_hook],
-            "logger": _Logger(),
-        }
-        cookies_browser = sc.get("cookies_browser")
-        if cookies_browser and _browser_cookies_ok is not False:
-            dl_opts["cookiesfrombrowser"] = (cookies_browser,)
-
-        def _fail(sc_id: str, message: str, title: str) -> None:
-            download_failures.append(title)
-            _broadcast({"type": "log", "id": sc_id, "level": "error", "message": message})
-
-        def _done(sc_id: str, title: str, status: str) -> None:
-            _broadcast({
-                "type": "track_done",
-                "id": sc_id,
-                "title": _short(title),
-                "status": status,
-                "downloaded": processed,
-                "saved": saved_count,
-                "total": total,
-            })
-
-        ydl = yt_dlp.YoutubeDL(dl_opts)
+    ydl = yt_dlp.YoutubeDL(dl_opts)
+    try:
         for sc_id in selected:
-            if _cancel.is_set():
-                break
+            _check_cancel(_counts())
             entry = existing_tracks[sc_id]
             title_hint = (entry.get("title") or sc_id)[:80]
-            prev_status = entry.get("status")
+            prev_status = entry.get("status") or "pending"
             # Перекачка уже отправленного в ЯМ трека не должна сбрасывать «uploaded».
             new_status = "uploaded" if prev_status == "uploaded" else "downloaded"
             current_id[0] = sc_id
@@ -682,20 +968,15 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
             if existing_file and Path(existing_file).exists():
                 processed += 1
                 saved_count += 1
-                if prev_status != new_status:
-                    _track_update(sc_id, status=new_status)
+                if prev_status != new_status or entry.get("error"):
+                    _track_update(sc_id, status=new_status, error="")
                 _done(sc_id, title_hint, new_status)
                 continue
-
-            # Файла нет (например, удалён после загрузки в ЯМ), но id мог
-            # остаться в archive.txt — уберём, иначе yt-dlp молча пропустит
-            # трек, а UI покажет «Файл не появился после скачивания».
-            _remove_from_archive(sc_id)
 
             url = entry.get("sc_url", "")
             if not url:
                 processed += 1
-                _fail(sc_id, f"Нет URL для трека: {title_hint}", title_hint)
+                _fail(sc_id, prev_status, title_hint, "нет ссылки на SoundCloud", "")
                 continue
             last_filepath[0] = None
             last_meta[0] = {}
@@ -704,8 +985,7 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
             try:
                 ydl.download([url])
             except Exception as e:
-                if _cancel.is_set():
-                    break  # отмена — не считаем её ошибкой скачивания
+                _check_cancel(_counts())  # отмена — не ошибка скачивания
                 if _is_cookie_db_error(str(e)) and "cookiesfrombrowser" in dl_opts:
                     # Браузер не найден — пересоздаём загрузчик без cookies
                     # и повторяем этот же трек.
@@ -721,8 +1001,7 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
                         dl_err = str(e2)[:280]
                 else:
                     dl_err = str(e)[:280]
-            if _cancel.is_set():
-                break
+            _check_cancel(_counts())
             processed += 1
             fpath = last_filepath[0]
             meta = last_meta[0]
@@ -735,132 +1014,113 @@ def _pipeline_worker(config: dict, do_upload: bool = True, track_ids: list | Non
                     artist=meta.get("uploader") or entry.get("artist", ""),
                     sc_url=url,
                     file=str(Path(fpath).resolve()),
+                    error="",
                 )
                 saved_count += 1
                 _done(sc_id, title or title_hint, new_status)
             else:
-                reason = dl_err or next(iter(errors[errors_before:][-1:]), "")
-                if "DRM protected" in reason:
-                    _fail(sc_id, f"{title_hint}: трек защищён DRM (SoundCloud Go+) — "
-                                 "скачать нельзя", title_hint)
-                elif dl_err is not None:
-                    _fail(sc_id, f"Ошибка скачивания ({title_hint}): {dl_err}", title_hint)
-                else:
-                    detail = f": {reason[:200]}" if reason else ""
-                    _fail(sc_id, f"Файл не появился после скачивания ({title_hint}){detail}",
-                          title_hint)
-
-        if _cancel.is_set():
-            _broadcast({"type": "cancelled", "downloaded": saved_count})
-            return
-
-        _broadcast({
-            "type": "dl_complete",
-            "downloaded": saved_count,
-            "errors": len(errors) + len(download_failures),
-            "failures": len(download_failures),
-        })
-
-        if do_upload:
-            _upload_phase(config, saved_count, track_ids=selected)
-        else:
-            _broadcast({
-                "type": "all_done",
-                "downloaded": saved_count,
-                "uploaded": 0,
-                "failures": len(download_failures),
-            })
-
-    except Exception as e:
-        _broadcast({"type": "error", "message": str(e)[:300]})
+                raw = dl_err or next(iter(errors[errors_before:][-1:]), "")
+                problem = f"не скачан: {raw[:200]}" if raw else "не скачан"
+                _fail(sc_id, prev_status, title_hint, problem, raw)
     finally:
-        if ydl is not None:
-            ydl.close()
+        ydl.close()
+
+    _broadcast({"type": "dl_complete", "downloaded": saved_count,
+                "errors": len(errors) + failures, "failures": failures})
+    return {"downloaded": saved_count, "failures": failures, "selected": selected}
+
+
+# ── Yandex Music ─────────────────────────────────────────────────────────
+
+def _ym_connect(playlist_url: str | None = None) -> dict:
+    """Сессия ЯМ по cookies Chrome (+ kind плейлиста). Ошибки → TaskError с понятным текстом."""
+    global _auth_cache
+    from ym_uploader import _create_session, _get_auth, _resolve_playlist_kind
+    try:
+        session = _create_session()
+        auth = _get_auth(session)
+    except Exception as e:
+        raise TaskError(str(e)[:300]) from e
+    if not auth.get("logged"):
+        raise TaskError(auth.get("error") or "Не авторизованы в Яндекс Музыке")
+    _auth_cache = {"at": time.monotonic(), "data": {
+        "authorized": True, "login": auth.get("login", "?"), "uid": auth.get("uid")}}
+    ctx = {"session": session, "uid": auth["uid"], "token": auth["token"],
+           "login": auth.get("login", "")}
+    if playlist_url is not None:
         try:
-            _cleanup_partials()
-        except OSError:
-            pass
-        _set_task(None)
+            kind = _resolve_playlist_kind(session, playlist_url, auth["token"], auth["uid"])
+        except Exception as e:
+            raise TaskError(str(e)[:300]) from e
+        if not kind:
+            raise TaskError("Не удалось определить плейлист по ссылке")
+        ctx["kind"] = kind
+    return ctx
 
 
-def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None) -> None:
+def _check_auth(refresh: bool = False) -> dict:
+    """Проверка авторизации ЯМ с кэшем: успешный результат живёт AUTH_CACHE_TTL секунд."""
+    global _auth_cache
+    if (not refresh and _auth_cache is not None
+            and time.monotonic() - _auth_cache["at"] < AUTH_CACHE_TTL):
+        return {**_auth_cache["data"], "cached": True}
+    try:
+        _ym_connect()
+        return {**_auth_cache["data"], "cached": False}
+    except TaskError as e:
+        _auth_cache = None
+        err = str(e)
+        if "404" in err:
+            err = "API Яндекс Музыки недоступно (404) — обновите приложение"
+        return {"authorized": False, "error": err}
+
+
+def _do_upload(config: dict, track_ids: list | None = None) -> dict:
     """Загрузка треков в ЯМ; пишет upload_archive.txt как CLI.
 
-    Если передан track_ids — грузятся именно эти треки (даже уже отмеченные «uploaded»,
-    выбор пользователя в UI имеет приоритет). Иначе — все со статусом «downloaded»
-    (пакетная загрузка из левой панели, без привязки к выбору в списке).
-    Локальные файлы удаляются только при yandex_music.delete_after_upload: true в config.yaml.
+    track_ids — именно эти треки (даже уже «uploaded»: выбор пользователя в UI имеет
+    приоритет, UI предупреждает о дублях). Иначе — все со статусом «downloaded».
+    Возвращает итог; «мягкие» отказы (нет плейлиста, нет авторизации) — через level/message,
+    чтобы итог скачивания в той же задаче не терялся.
     """
-    ym = config.get("yandex_music", {})
+    from ym_uploader import DEFAULT_UPLOAD_ARCHIVE, _record_uploaded, _upload_one, get_playlist_tracks
+
+    ym = config.get("yandex_music") or {}
     playlist_url = ym.get("playlist_url", "")
     if not playlist_url:
-        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "warn",
-                     "message": "URL плейлиста ЯМ не задан — загрузка пропущена."})
-        return
-
-    try:
-        from ym_uploader import (
-            DEFAULT_UPLOAD_ARCHIVE,
-            _create_session,
-            _get_auth,
-            _record_uploaded,
-            _resolve_playlist_kind,
-            _upload_one,
-            get_playlist_tracks,
-        )
-    except ImportError:
-        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "error",
-                     "message": "Модуль ym_uploader не найден"})
-        return
+        return {"uploaded": 0, "level": "warn",
+                "message": "Плейлист ЯМ не задан — загрузка пропущена"}
 
     tracks = _load_tracks()
     if track_ids is not None:
         selected = {str(tid) for tid in track_ids}
-        to_upload = [
-            (sid, info) for sid, info in tracks.items()
-            if sid in selected and info.get("file") and Path(info["file"]).exists()
-        ]
+        to_upload = [(sid, info) for sid, info in tracks.items()
+                     if sid in selected and info.get("file") and Path(info["file"]).exists()]
+        if not to_upload:
+            return {"uploaded": 0, "level": "warn",
+                    "message": "У выбранных треков нет файлов — сначала скачайте их"}
     else:
-        to_upload = [
-            (sid, info) for sid, info in tracks.items()
-            if info.get("status") == "downloaded" and info.get("file") and Path(info["file"]).exists()
-        ]
-
-    if not to_upload:
-        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "warn",
-                     "message": "Нет треков для загрузки в ЯМ"})
-        return
+        to_upload = [(sid, info) for sid, info in tracks.items()
+                     if info.get("status") == "downloaded"
+                     and info.get("file") and Path(info["file"]).exists()]
+        if not to_upload:
+            return {"uploaded": 0, "level": "warn", "message": "Нет треков для загрузки в ЯМ"}
 
     _broadcast({"type": "upload_start", "total": len(to_upload), "skipped": 0})
-
     try:
-        session = _create_session()
-        auth = _get_auth(session)
-        if not auth.get("logged"):
-            _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "error",
-                         "message": auth.get("error", "Не авторизованы в ЯМ")})
-            return
-        token = auth["token"]
-        uid = auth["uid"]
-        kind = _resolve_playlist_kind(session, playlist_url, token, uid)
-        if not kind:
-            _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "error",
-                         "message": "Не удалось определить плейлист"})
-            return
-    except Exception as e:
-        _broadcast({"type": "all_done", "downloaded": dl_count, "uploaded": 0, "level": "error",
-                     "message": str(e)[:200]})
-        return
+        ctx = _ym_connect(playlist_url)
+    except TaskError as e:
+        return {"uploaded": 0, "level": "error", "message": str(e)}
+    session, uid, token, kind = ctx["session"], ctx["uid"], ctx["token"], ctx["kind"]
 
     uploaded = 0
     upload_errors = 0
-    upload_delay = ym.get("upload_delay", 3)
+    upload_delay = float(ym.get("upload_delay", 3))
     del_after = bool(ym.get("delete_after_upload", False))
     accepted: list[str] = []  # приняты сервером, но ещё не подтверждены в плейлисте
 
     for sc_id, info in to_upload:
-        if _cancel.is_set():
-            break
+        _check_cancel({"uploaded": uploaded})
         filepath = Path(info["file"])
         name = filepath.stem
         _broadcast({
@@ -875,12 +1135,12 @@ def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None
             if res:
                 uploaded += 1
                 _record_uploaded(DEFAULT_UPLOAD_ARCHIVE, filepath)
-                _track_update(sc_id, status="uploaded")
+                _track_update(sc_id, status="uploaded", error="")
                 if res == "accepted":
                     accepted.append(sc_id)
                     _broadcast({"type": "log", "id": sc_id, "level": "warn",
-                                 "message": f"{name}: файл принят, ЯМ ещё обрабатывает — "
-                                            "проверю плейлист после загрузки"})
+                                "message": f"{name}: файл принят, ЯМ ещё обрабатывает — "
+                                           "проверю плейлист после загрузки"})
                 # Удаляем только при точном подтверждении по id трека: «grown» (плейлист
                 # вырос — мог вырасти и за счёт прошлого дообработанного трека) и
                 # «accepted» не гарантируют, что доехал именно этот файл.
@@ -890,22 +1150,22 @@ def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None
                 _broadcast({"type": "track_uploaded", "id": sc_id})
             else:
                 upload_errors += 1
+                _track_update(sc_id, error="Не удалось загрузить в ЯМ")
                 _broadcast({"type": "log", "id": sc_id, "level": "error",
-                             "message": f"{name}: не удалось загрузить"})
+                            "message": f"{name}: не удалось загрузить"})
         except Exception as e:
+            _check_cancel({"uploaded": uploaded})
             upload_errors += 1
+            _track_update(sc_id, error=f"ЯМ: {e!s:.200}")
             _broadcast({"type": "log", "id": sc_id, "level": "error", "message": f"{name}: {e!s:.100}"})
         if _cancel.wait(upload_delay):
             break  # «Остановить» прерывает и паузу между загрузками
-
-    if _cancel.is_set():
-        _broadcast({"type": "cancelled", "downloaded": dl_count, "uploaded": uploaded})
-        return
+    _check_cancel({"uploaded": uploaded})
 
     # ── Автопроверка: дожидаемся появления принятых треков в плейлисте ──
     if accepted:
         _broadcast({"type": "log", "level": "info",
-                     "message": f"Проверяю плейлист: жду появления {len(accepted)} трек(ов)…"})
+                    "message": f"Проверяю плейлист: жду появления {len(accepted)} трек(ов)…"})
         tracks_db = _load_tracks()
         pending_ids = set(accepted)
         try:
@@ -921,111 +1181,442 @@ def _upload_phase(config: dict, dl_count: int = 0, track_ids: list | None = None
                     if k in keys or (k[1] and k[1] in titles):
                         pending_ids.discard(sid)
                         _broadcast({"type": "log", "id": sid, "level": "info",
-                                     "message": f"{(info.get('title') or sid)[:50]}: "
-                                                "появился в плейлисте ✓"})
+                                    "message": f"{(info.get('title') or sid)[:50]}: "
+                                               "появился в плейлисте ✓"})
                 if not pending_ids:
                     break
         except Exception:
             pass  # сверка — не повод ронять итог загрузки
         if pending_ids:
             _broadcast({"type": "log", "level": "warn",
-                         "message": f"Пока не видны в плейлисте: {len(pending_ids)} — "
-                                    "нажмите «Сверить плейлист» через пару минут"})
+                        "message": f"Пока не видны в плейлисте: {len(pending_ids)} — "
+                                   "сверьте плейлист через пару минут"})
 
-    _broadcast({
-        "type": "all_done",
-        "downloaded": dl_count,
-        "uploaded": uploaded,
-        "upload_errors": upload_errors,
-    })
+    result = {"uploaded": uploaded, "upload_errors": upload_errors}
+    if upload_errors:
+        result["level"] = "warn"
+    return result
 
 
-# ── Upload-only worker ───────────────────────────────────────────────────
-
-def _upload_only_worker(config: dict) -> None:
+def _playlist_report(config: dict) -> dict:
+    """Сверка треков «в ЯМ» из базы с плейлистом: ненайденные, дубли, в обработке."""
+    global _last_report
+    from ym_uploader import get_playlist_info, get_playlist_tracks
+    playlist_url = (config.get("yandex_music") or {}).get("playlist_url", "")
+    if not playlist_url:
+        raise TaskError("Плейлист ЯМ не задан — укажите ссылку в настройках")
+    ctx = _ym_connect(playlist_url)
     try:
-        _upload_phase(config)
+        pl_info = get_playlist_info(ctx["session"], ctx["uid"], ctx["kind"], ctx["token"])
+        pl_tracks = get_playlist_tracks(ctx["session"], ctx["uid"], ctx["kind"], ctx["token"])
     except Exception as e:
-        _broadcast({"type": "error", "message": str(e)[:300]})
-    finally:
-        _set_task(None)
+        raise TaskError(f"Ошибка API Яндекс Музыки: {e!s:.200}") from e
+
+    pl_keys = [(_norm(t["artist"]), _norm(t["title"])) for t in pl_tracks]
+    key_set = set(pl_keys)
+    titles = {k[1] for k in pl_keys if k[1]}
+    first_seen: dict[tuple, dict] = {}
+    for key, t in zip(pl_keys, pl_tracks):
+        first_seen.setdefault(key, t)
+    dups = [
+        {"artist": first_seen[k]["artist"], "title": first_seen[k]["title"], "count": c}
+        for k, c in Counter(pl_keys).most_common() if c > 1 and k != ("", "")
+    ]
+    processing = [{"artist": t["artist"], "title": t["title"]}
+                  for t in pl_tracks if not t["available"]]
+
+    tracks = _load_tracks()
+    found = 0
+    missing: list[dict] = []
+    for sid, info in tracks.items():
+        if info.get("status") != "uploaded":
+            continue
+        k = (_norm(info.get("artist")), _norm(info.get("title")))
+        if k in key_set or (k[1] and k[1] in titles):
+            found += 1
+        else:
+            missing.append(_track_view(sid, info))
+    _last_report = {
+        "checked_at": time.time(),
+        "playlist": pl_info,
+        "playlist_total": len(pl_tracks),
+        "found": found,
+        "missing_total": len(missing),
+        "missing": missing,
+        "duplicates": sum(d["count"] - 1 for d in dups),
+        "duplicates_list": dups,
+        "processing": len(processing),
+        "processing_list": processing,
+    }
+    return _last_report
 
 
-# ── Mark-all-uploaded worker ─────────────────────────────────────────────
+# ── Tasks ────────────────────────────────────────────────────────────────
+
+def _task_scan(config: dict) -> dict:
+    return _do_scan(config)
+
+
+def _task_download(config: dict, track_ids: list | None, do_upload: bool) -> dict:
+    dl = _do_download(config, track_ids)
+    summary = {"downloaded": dl["downloaded"], "failures": dl["failures"]}
+    if do_upload:
+        try:
+            summary.update(_do_upload(config, track_ids=dl["selected"]))
+        except TaskCancelled as c:
+            raise TaskCancelled({**summary, **c.counts}) from None
+    _broadcast({"type": "all_done", "task": "download", **summary})
+    return summary
+
+
+def _task_upload(config: dict, track_ids: list | None) -> dict:
+    summary = _do_upload(config, track_ids)
+    _broadcast({"type": "all_done", "task": "upload", **summary})
+    return summary
+
+
+def _task_sync(config: dict, opts: dict | None = None) -> dict:
+    """«Синхронизировать»: проверить лайки → скачать новые → загрузить в ЯМ → сверить."""
+    opts = opts or {}
+    summary: dict = {}
+    _broadcast({"type": "sync_step", "step": "scan"})
+    summary["new_count"] = _do_scan(config)["new_count"]
+
+    if opts.get("download", True):
+        _check_cancel(summary)
+        pending = [sid for sid, t in _load_tracks().items() if t.get("status") == "pending"]
+        if pending:
+            _broadcast({"type": "sync_step", "step": "download"})
+            try:
+                dl = _do_download(config, pending)
+            except TaskCancelled as c:
+                raise TaskCancelled({**summary, **c.counts}) from None
+            summary.update(downloaded=dl["downloaded"], failures=dl["failures"])
+
+    playlist_url = (config.get("yandex_music") or {}).get("playlist_url", "")
+    if opts.get("upload", True) and playlist_url:
+        _check_cancel(summary)
+        _broadcast({"type": "sync_step", "step": "upload"})
+        try:
+            up = _do_upload(config)
+        except TaskCancelled as c:
+            raise TaskCancelled({**summary, **c.counts}) from None
+        if up.get("level") == "error" or up.get("uploaded") or up.get("upload_errors"):
+            summary.update(up)
+        _check_cancel(summary)
+        if summary.get("level") != "error":
+            _broadcast({"type": "sync_step", "step": "verify"})
+            try:
+                rep = _playlist_report(config)
+                summary["missing"] = rep["missing_total"]
+                summary["duplicates"] = rep["duplicates"]
+            except TaskError as e:
+                summary.update(level="warn", message=f"Сверка не выполнена: {e}")
+
+    if summary.get("failures") and not summary.get("level"):
+        summary["level"] = "warn"
+    _broadcast({"type": "all_done", "task": "sync", **summary})
+    return summary
+
+
+# ── Autosync scheduler ───────────────────────────────────────────────────
+
+def _last_auto_run() -> float | None:
+    for rec in _load_history():
+        if rec.get("trigger") == "auto":
+            return rec.get("started_at")
+    return None
+
+
+def _autosync_state(settings: dict | None = None) -> dict:
+    au = (settings or _settings())["autosync"]
+    last = _last_auto_run()
+    next_run = None
+    if au["enabled"]:
+        next_run = last + au["interval_hours"] * 3600 if last else time.time()
+    return {**au, "last_run": last, "next_run": next_run}
+
+
+def _scheduler_loop() -> None:
+    """Раз в 30 с: если автосинхронизация включена и подошло время — запускаем sync.
+    Занято другой задачей — попробуем на следующем тике."""
+    while True:
+        time.sleep(30)
+        try:
+            cfg = _load_config()
+            s = _settings(cfg)
+            state = _autosync_state(s)
+            if not state["enabled"] or not s["soundcloud"]["username"] or _active_task:
+                continue
+            if state["next_run"] is not None and time.time() >= state["next_run"]:
+                _start_task("sync", _task_sync, cfg,
+                            {"download": state["download"], "upload": state["upload"]},
+                            trigger="auto")
+        except Exception:
+            pass
+
+
+# ── Mark / unmark ────────────────────────────────────────────────────────
 
 def _mark_uploaded(track_ids: list[str] | None = None, *, mark_all_pending: bool = False) -> int:
-    """Помечает выбранные (или все pending / downloaded / not_in_likes) как уже в ЯМ.
+    """Помечает выбранные (или все не загруженные) как уже в ЯМ.
 
     Пути существующих файлов дописываются в upload_archive.txt, чтобы CLI
     (sc_downloader.py --upload) не залил их повторно.
     """
+    from ym_uploader import DEFAULT_UPLOAD_ARCHIVE, _record_uploaded
+    movable = ("pending", "downloaded", "not_in_likes", "unavailable")
     marked_files: list[Path] = []
     with _db_lock:
         tracks = _load_tracks()
         if mark_all_pending:
-            target = {
-                sid for sid, inf in tracks.items()
-                if inf.get("status") in ("pending", "downloaded", "not_in_likes")
-            }
+            target = {sid for sid, inf in tracks.items() if inf.get("status") in movable}
         elif track_ids is not None:
             target = {str(tid) for tid in track_ids}
         else:
             return 0
         count = 0
         for sid, info in tracks.items():
-            if info.get("status") in ("pending", "downloaded", "not_in_likes"):
-                if sid not in target:
-                    continue
-                info["status"] = "uploaded"
-                count += 1
-                fpath = info.get("file")
-                if fpath and Path(fpath).exists():
-                    marked_files.append(Path(fpath))
+            if sid not in target or info.get("status") not in movable:
+                continue
+            info["status"] = "uploaded"
+            info["error"] = ""
+            count += 1
+            fpath = info.get("file")
+            if fpath and Path(fpath).exists():
+                marked_files.append(Path(fpath))
         _save_tracks(tracks)
     _sync_archive()
-    if marked_files:
-        try:
-            from ym_uploader import DEFAULT_UPLOAD_ARCHIVE, _record_uploaded
-            for fp in marked_files:
-                _record_uploaded(DEFAULT_UPLOAD_ARCHIVE, fp)
-        except ImportError:
-            pass
+    for fp in marked_files:
+        _record_uploaded(DEFAULT_UPLOAD_ARCHIVE, fp)
     return count
 
 
-# ── Routes ───────────────────────────────────────────────────────────────
+def _unmark_uploaded(track_ids: list[str]) -> int:
+    """Снимает отметку «В ЯМ»: есть файл → downloaded, нет → pending.
+    Файл убирается из upload_archive.txt, чтобы его можно было загрузить снова."""
+    from ym_uploader import DEFAULT_UPLOAD_ARCHIVE, _forget_uploaded
+    names: set[str] = set()
+    count = 0
+    with _db_lock:
+        tracks = _load_tracks()
+        for sid in {str(t) for t in track_ids}:
+            info = tracks.get(sid)
+            if not info or info.get("status") != "uploaded":
+                continue
+            fpath = info.get("file")
+            has_file = bool(fpath and Path(fpath).exists())
+            info["status"] = "downloaded" if has_file else "pending"
+            if fpath:
+                names.add(Path(fpath).name)
+            count += 1
+        _save_tracks(tracks)
+    _sync_archive()
+    _forget_uploaded(DEFAULT_UPLOAD_ARCHIVE, names)
+    return count
+
+
+# ── SoundCloud profile check ─────────────────────────────────────────────
+
+def _soundcloud_user(user: str) -> dict | None:
+    """Профиль SoundCloud: имя и число лайков. None — профиль не найден.
+
+    Сначала через внутренний API экстрактора yt-dlp (даёт likes_count); если он
+    поменялся — упрощённая проверка существования через страницу лайков.
+    """
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "logger": _SilentLogger()}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        try:
+            ie = ydl.get_info_extractor("SoundcloudUser")
+            ie.initialize()
+            data = ie._call_api(ie._resolv_url(ie._BASE_URL + user), user, headers=ie._HEADERS)
+            return {"display_name": data.get("username") or user,
+                    "likes_count": data.get("likes_count") or data.get("public_favorites_count")}
+        except Exception as e:
+            if "404" in str(e):
+                return None
+        info = ydl.extract_info(f"https://soundcloud.com/{user}/likes",
+                                download=False, process=False)
+        title = (info or {}).get("title") or ""
+        return {"display_name": re.sub(r"\s*\(Likes\)$", "", title) or user,
+                "likes_count": None}
+
+
+# ── Routes: pages ────────────────────────────────────────────────────────
+
+def _asset_version() -> str:
+    """Версия статики для сброса кэша браузера: время последнего изменения файлов."""
+    try:
+        return str(int(max(p.stat().st_mtime for p in STATIC_DIR.rglob("*") if p.is_file())))
+    except ValueError:
+        return "0"
+
 
 @app.route("/")
 def index():
-    return HTML_PAGE
+    return render_template("index.html", v=_asset_version())
 
+
+# ── Routes: state & settings ─────────────────────────────────────────────
 
 @app.route("/api/status")
 def api_status():
-    cfg = _load_config()
-    sc = cfg.get("soundcloud", {})
-    ym = cfg.get("yandex_music", {})
+    s = _settings()
     return jsonify({
-        "username": _extract_username(sc.get("profile_url", "")),
-        "playlist_url": ym.get("playlist_url", ""),
+        "username": s["soundcloud"]["username"],
+        "configured": bool(s["soundcloud"]["username"]),
+        "playlist_url": s["yandex_music"]["playlist_url"],
         "stats": _music_stats(),
         "active_task": _active_task,
+        "task": ({"name": _active_task, "trigger": _task_trigger, "started_at": _task_started_at}
+                 if _active_task else None),
+        "autosync": _autosync_state(s),
     })
 
 
-@app.route("/api/save", methods=["POST"])
-def api_save():
-    data = request.get_json(silent=True) or {}
+@app.route("/api/settings")
+def api_settings_get():
+    return jsonify(_settings())
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_post():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Ожидается JSON-объект"}), 400
     cfg = _load_config()
-    username = (data.get("username") or "").strip()
-    if username:
-        cfg.setdefault("soundcloud", {})["profile_url"] = _profile_url(username)
-    playlist_url = data.get("playlist_url")
-    if playlist_url is not None:
-        cfg.setdefault("yandex_music", {})["playlist_url"] = str(playlist_url).strip()
+    try:
+        _apply_settings(cfg, data)
+    except ValueError as e:
+        field, message = e.args if len(e.args) == 2 else ("", str(e))
+        return jsonify({"error": message, "field": field}), 400
     _save_config(cfg)
+    return jsonify({"ok": True, "settings": _settings(cfg)})
+
+
+@app.route("/api/validate/soundcloud", methods=["POST"])
+def api_validate_soundcloud():
+    data = request.get_json(silent=True) or {}
+    user = _sc_username(str(data.get("username") or ""))
+    if not user:
+        return jsonify({"ok": False, "error": "Введите имя или ссылку на профиль"})
+    try:
+        info = _soundcloud_user(user)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"SoundCloud недоступен: {e!s:.150}"}), 502
+    if info is None:
+        return jsonify({"ok": False, "error": f"Профиль «{user}» не найден на SoundCloud"})
+    return jsonify({"ok": True, "username": user, "profile_url": _profile_url(user), **info})
+
+
+@app.route("/api/validate/playlist", methods=["POST"])
+def api_validate_playlist():
+    from ym_uploader import get_playlist_info
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("playlist_url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "Вставьте ссылку на плейлист"})
+    if "music.yandex." not in url:
+        return jsonify({"ok": False, "error": "Это не ссылка на Яндекс Музыку"})
+    try:
+        ctx = _ym_connect(url)
+        info = get_playlist_info(ctx["session"], ctx["uid"], ctx["kind"], ctx["token"])
+    except TaskError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{e!s:.200}"})
+    return jsonify({"ok": True, **info})
+
+
+@app.route("/api/check-yandex")
+def api_check_yandex():
+    return jsonify(_check_auth(refresh=request.args.get("refresh") == "1"))
+
+
+# ── Routes: tracks ───────────────────────────────────────────────────────
+
+@app.route("/api/tracks")
+def api_tracks():
+    """Все треки из локальной базы. Порядок: последние добавленные сверху."""
+    tracks = _load_tracks()
+    return jsonify({"tracks": [_track_view(sid, info)
+                               for sid, info in reversed(list(tracks.items()))]})
+
+
+def _track_file(sc_id: str) -> Path:
+    info = _load_tracks().get(sc_id)
+    f = info and info.get("file")
+    if not f:
+        abort(404)
+    p = Path(f)
+    if not p.exists() or p.suffix.lower() not in AUDIO_EXTS:
+        abort(404)
+    return p
+
+
+@app.route("/api/tracks/<sc_id>/audio")
+def api_track_audio(sc_id: str):
+    p = _track_file(sc_id)
+    return send_file(p, mimetype=AUDIO_MIME.get(p.suffix.lower()), conditional=True, max_age=0)
+
+
+@app.route("/api/tracks/<sc_id>/reveal", methods=["POST"])
+def api_track_reveal(sc_id: str):
+    p = _track_file(sc_id)
+    try:
+        subprocess.Popen(["open", "-R", str(p)])
+    except OSError as e:
+        return jsonify({"error": str(e)[:200]}), 500
     return jsonify({"ok": True})
 
+
+def _ids_from_request() -> list[str] | None:
+    data = request.get_json(silent=True) or {}
+    ids = data.get("track_ids")
+    if ids is None:
+        return None
+    if not isinstance(ids, list):
+        raise ValueError("track_ids должен быть списком")
+    return [str(i) for i in ids]
+
+
+@app.route("/api/mark-uploaded", methods=["POST"])
+def api_mark_uploaded():
+    """Помечает треки как уже в ЯМ: по списку track_ids или все при mark_all_pending: true."""
+    data = request.get_json(silent=True) or {}
+    track_ids = data.get("track_ids")
+    mark_all_pending = bool(data.get("mark_all_pending"))
+    # Работаем не выпуская _task_lock: иначе между проверкой _active_task
+    # и записью CSV успел бы стартовать scan/pipeline (TOCTOU).
+    with _task_lock:
+        if _active_task:
+            return jsonify({"error": "Дождитесь завершения текущей задачи"}), 409
+        if mark_all_pending:
+            count = _mark_uploaded(mark_all_pending=True)
+        elif isinstance(track_ids, list) and track_ids:
+            count = _mark_uploaded(track_ids)
+        else:
+            return jsonify({"error": "Передайте track_ids или mark_all_pending: true"}), 400
+    return jsonify({"ok": True, "marked": count})
+
+
+@app.route("/api/unmark-uploaded", methods=["POST"])
+def api_unmark_uploaded():
+    try:
+        ids = _ids_from_request()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not ids:
+        return jsonify({"error": "Передайте track_ids"}), 400
+    with _task_lock:
+        if _active_task:
+            return jsonify({"error": "Дождитесь завершения текущей задачи"}), 409
+        count = _unmark_uploaded(ids)
+    return jsonify({"ok": True, "unmarked": count})
+
+
+# ── Routes: tasks ────────────────────────────────────────────────────────
 
 def _started(err: str | None):
     if err:
@@ -1035,27 +1626,37 @@ def _started(err: str | None):
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    return _started(_start_task("scan", _scan_worker, _load_config()))
+    return _started(_start_task("scan", _task_scan, _load_config()))
 
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
     data = request.get_json(silent=True) or {}
+    try:
+        ids = _ids_from_request()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     do_upload = bool(data.get("upload", True))
-    track_ids = data.get("track_ids")
-    if track_ids is not None and not isinstance(track_ids, list):
-        return jsonify({"error": "track_ids должен быть списком"}), 400
-    return _started(_start_task("pipeline", _pipeline_worker, _load_config(), do_upload, track_ids))
+    return _started(_start_task("download", _task_download, _load_config(), ids, do_upload))
 
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    return _started(_start_task("upload", _upload_only_worker, _load_config()))
+    try:
+        ids = _ids_from_request()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return _started(_start_task("upload", _task_upload, _load_config(), ids))
+
+
+@app.route("/api/sync", methods=["POST"])
+def api_sync():
+    return _started(_start_task("sync", _task_sync, _load_config(), {}))
 
 
 @app.route("/api/cancel", methods=["POST"])
 def api_cancel():
-    """Только сигнал отмены — active_task сбрасывает сам воркер в finally."""
+    """Только сигнал отмены — active_task сбрасывает сам воркер, когда остановится."""
     _cancel.set()
     return jsonify({"ok": True})
 
@@ -1075,131 +1676,48 @@ def api_force_clear():
     return jsonify({"ok": True, "cleared": old})
 
 
-@app.route("/api/mark-uploaded", methods=["POST"])
-def api_mark_uploaded():
-    """Помечает треки как уже в ЯМ: по списку track_ids или все новые при mark_all_pending: true."""
-    data = request.get_json(silent=True) or {}
-    track_ids = data.get("track_ids")
-    mark_all_pending = bool(data.get("mark_all_pending"))
-    # Работаем не выпуская _task_lock: иначе между проверкой _active_task
-    # и записью CSV успел бы стартовать scan/pipeline (TOCTOU).
-    with _task_lock:
-        if _active_task:
-            return jsonify({"error": "Дождитесь завершения текущей задачи"}), 409
-        if mark_all_pending:
-            count = _mark_uploaded(mark_all_pending=True)
-        elif track_ids is not None and len(track_ids) > 0:
-            count = _mark_uploaded(track_ids)
-        else:
-            return jsonify({"error": "Передайте track_ids или mark_all_pending: true"}), 400
-    return jsonify({"ok": True, "marked": count})
-
-
 @app.route("/api/open-folder", methods=["POST"])
 def api_open_folder():
     music_dir = _music_dir()
     music_dir.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.Popen(["open", str(music_dir)])
-    except Exception as e:
+    except OSError as e:
         return jsonify({"error": str(e)[:200]}), 500
     return jsonify({"ok": True})
 
 
-@app.route("/api/check-yandex")
-def api_check_yandex():
-    try:
-        from ym_uploader import _create_session, _get_auth
-        session = _create_session()
-        auth = _get_auth(session)
-        if auth.get("logged"):
-            return jsonify({
-                "authorized": True,
-                "login": auth.get("login", "?"),
-                "uid": auth.get("uid"),
-            })
-        return jsonify({
-            "authorized": False,
-            "error": auth.get("error", "Войдите в music.yandex.ru в Chrome"),
-        })
-    except Exception as e:
-        err = str(e)
-        if "404" in err:
-            err = (
-                "Старый API Яндекс Музыки недоступен (404). "
-                "Обновите ym_uploader.py или перезапустите приложение."
-            )
-        return jsonify({"authorized": False, "error": err[:300]})
-
-
-@app.route("/api/tracks")
-def api_tracks():
-    """Все треки из локальной базы — чтобы список был виден сразу, без скана SC.
-
-    Порядок: последние добавленные сверху (в CSV новые дописываются в конец).
-    """
-    tracks = _load_tracks()
-    out = [
-        {
-            "id": sid,
-            "title": info.get("title", "") or sid,
-            "artist": info.get("artist", ""),
-            "status": info.get("status", "pending"),
-        }
-        for sid, info in reversed(list(tracks.items()))
-    ]
-    return jsonify({"tracks": out})
+@app.route("/api/check-playlist")
+def api_check_playlist_last():
+    """Последний результат сверки (от кнопки или синхронизации) — без обращения к ЯМ."""
+    return jsonify({"report": _last_report})
 
 
 @app.route("/api/check-playlist", methods=["POST"])
 def api_check_playlist():
     """Сверяет локальную базу (uploaded-треки) с реальным содержимым плейлиста ЯМ."""
     cfg = _load_config()
-    playlist_url = cfg.get("yandex_music", {}).get("playlist_url", "")
-    if not playlist_url:
+    if not (cfg.get("yandex_music") or {}).get("playlist_url"):
         return jsonify({"error": "URL плейлиста не задан"}), 400
     try:
-        from ym_uploader import (
-            _create_session, _get_auth, _resolve_playlist_kind, get_playlist_tracks,
-        )
-        session = _create_session()
-        auth = _get_auth(session)
-        if not auth.get("logged"):
-            return jsonify({"error": auth.get("error", "Не авторизованы в ЯМ")}), 401
-        kind = _resolve_playlist_kind(session, playlist_url, auth["token"], auth["uid"])
-        if not kind:
-            return jsonify({"error": "Не удалось определить плейлист"}), 400
-        pl_tracks = get_playlist_tracks(session, auth["uid"], kind, auth["token"])
-    except Exception as e:
-        return jsonify({"error": str(e)[:300]}), 502
+        return jsonify(_playlist_report(cfg))
+    except TaskError as e:
+        return jsonify({"error": str(e)}), 502
 
-    from collections import Counter
-    pl_keys = [(_norm(t["artist"]), _norm(t["title"])) for t in pl_tracks]
-    key_set = set(pl_keys)
-    titles = {k[1] for k in pl_keys if k[1]}
-    dup_count = sum(c - 1 for k, c in Counter(pl_keys).items() if c > 1 and k != ("", ""))
-    processing = sum(1 for t in pl_tracks if not t["available"])
 
-    tracks = _load_tracks()
-    found = 0
-    missing: list[dict] = []
-    for sid, info in tracks.items():
-        if info.get("status") != "uploaded":
-            continue
-        k = (_norm(info.get("artist")), _norm(info.get("title")))
-        if k in key_set or (k[1] and k[1] in titles):
-            found += 1
-        else:
-            missing.append({"id": sid, "title": info.get("title", ""),
-                            "artist": info.get("artist", "")})
-    return jsonify({
-        "playlist_total": len(pl_tracks),
-        "found": found,
-        "missing_total": len(missing),
-        "missing": missing[:30],
-        "duplicates": dup_count,
-        "processing": processing,
-    })
+@app.route("/api/history")
+def api_history():
+    items = [{k: v for k, v in rec.items() if k != "events"} | {"events_count": len(rec.get("events", []))}
+             for rec in _load_history()]
+    return jsonify({"items": items})
+
+
+@app.route("/api/history/<rec_id>")
+def api_history_item(rec_id: str):
+    for rec in _load_history():
+        if rec.get("id") == rec_id:
+            return jsonify(rec)
+    abort(404)
 
 
 @app.route("/api/progress")
@@ -1207,7 +1725,8 @@ def api_progress():
     q: queue.Queue = queue.Queue(maxsize=256)
     # Первое событие — текущее состояние: после сна/обрыва связи клиент
     # переподключается и может понять, что задача уже закончилась.
-    q.put_nowait(json.dumps({"type": "hello", "active_task": _active_task}))
+    q.put_nowait(json.dumps({"type": "hello", "active_task": _active_task,
+                             "trigger": _task_trigger}))
     with _clients_lock:
         _clients.append(q)
 
@@ -1233,851 +1752,12 @@ def api_progress():
     )
 
 
-# ── HTML ─────────────────────────────────────────────────────────────────
-
-HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Музыкальный</title>
-<style>
-:root{
-  --bg:#0a0a12;--surface:#12122a;--surface-2:#171736;--border:#1e1e44;
-  --primary:#8b5cf6;--primary-h:#a78bfa;--primary-glow:rgba(139,92,246,.25);
-  --ok:#10b981;--ok-bg:rgba(16,185,129,.14);
-  --err:#f43f5e;--err-bg:rgba(244,63,94,.14);
-  --warn:#f59e0b;--warn-bg:rgba(245,158,11,.14);
-  --info:#38bdf8;--info-bg:rgba(56,189,248,.14);
-  --text:#e2e8f0;--dim:#7b88a8;--faint:#4b5573;--input:#0d0d1f;
-  --radius:12px;--radius-sm:8px;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
-  background:var(--bg);color:var(--text);height:100vh;line-height:1.5;overflow:hidden}
-::selection{background:var(--primary-glow)}
-
-.shell{max-width:1180px;margin:0 auto;padding:16px 24px 12px;
-  display:flex;flex-direction:column;gap:14px;height:100vh}
-
-.topbar{display:flex;align-items:baseline;justify-content:center;gap:10px;flex-shrink:0}
-.topbar h1{font-size:21px;font-weight:800;letter-spacing:-.01em;
-  background:linear-gradient(135deg,#8b5cf6,#ec4899);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.topbar span{font-size:12px;color:var(--dim)}
-
-.layout{display:grid;grid-template-columns:296px 1fr;gap:14px;min-height:0;flex:1}
-
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-  padding:14px;flex-shrink:0}
-.rail{display:flex;flex-direction:column;gap:12px;overflow-y:auto;min-height:0}
-.card h2{font-size:10.5px;font-weight:700;color:var(--dim);text-transform:uppercase;
-  letter-spacing:.6px;display:flex;align-items:center;gap:7px;margin-bottom:11px}
-.card h2 .dot{width:6px;height:6px;border-radius:50%;background:var(--primary);flex-shrink:0}
-
-.field{margin-bottom:9px}
-.field label{display:block;font-size:11px;color:var(--dim);margin-bottom:5px}
-input[type=text],input[type=url]{width:100%;padding:9px 11px;
-  background:var(--input);border:1px solid var(--border);border-radius:var(--radius-sm);
-  color:var(--text);font-size:13px;outline:none;transition:border .15s,box-shadow .15s;
-  font-family:inherit}
-input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-glow)}
-input:disabled{opacity:.5}
-
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;
-  padding:9px 14px;border:none;border-radius:var(--radius-sm);font-size:13px;font-weight:600;
-  cursor:pointer;transition:transform .12s,box-shadow .12s,background .12s;width:100%;
-  font-family:inherit}
-.btn:active:not(:disabled){transform:translateY(1px)}
-.btn:disabled{opacity:.4;cursor:not-allowed}
-.btn-p{background:var(--primary);color:#fff}
-.btn-p:hover:not(:disabled){background:var(--primary-h);box-shadow:0 4px 14px var(--primary-glow)}
-.btn-s{background:var(--surface-2);color:var(--text);border:1px solid var(--border)}
-.btn-s:hover:not(:disabled){border-color:var(--primary)}
-.btn-ghost{background:transparent;color:var(--dim);border:1px solid var(--border);font-size:12px}
-.btn-ghost:hover:not(:disabled){color:var(--text);border-color:var(--faint)}
-.btn-stop{background:transparent;color:var(--err);border:1px solid rgba(244,63,94,.35)}
-.btn-stop:hover:not(:disabled){background:var(--err-bg)}
-.btn-auto{width:auto}
-
-.rowbtns{display:flex;gap:8px;margin-top:10px}
-
-.statgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px;position:relative}
-.stat{background:var(--surface-2);border-radius:var(--radius-sm);padding:9px 6px;text-align:center}
-.stat b{display:block;font-size:17px;font-weight:800;font-variant-numeric:tabular-nums;color:var(--text)}
-.stat span{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.4px}
-.new-flag{position:absolute;top:-7px;right:-7px;background:var(--ok);color:#04140d;
-  font-size:10px;font-weight:800;padding:2px 7px;border-radius:99px;display:none;
-  box-shadow:0 2px 8px rgba(0,0,0,.3)}
-.new-flag.on{display:block;animation:fadeIn .3s ease}
-
-.syncline{font-size:11.5px;color:var(--dim);padding-top:9px;border-top:1px solid var(--border)}
-.syncline b{color:var(--ok);font-weight:700}
-.syncline.warn b{color:var(--warn)}
-
-.authpill{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:99px;
-  font-size:12px;font-weight:600;margin-bottom:11px}
-.authpill.ok{background:var(--ok-bg);color:var(--ok)}
-.authpill.fail{background:var(--err-bg);color:var(--err)}
-.authpill.wait{background:var(--warn-bg);color:var(--warn)}
-
-.hint{font-size:11px;color:var(--faint);margin-top:9px;line-height:1.45}
-
-/* worklist */
-.worklist{display:flex;flex-direction:column;gap:10px;min-height:0}
-
-.toolbar{display:flex;align-items:center;gap:9px;flex-shrink:0;flex-wrap:wrap}
-.toolbar h2{font-size:15px;font-weight:700;white-space:nowrap}
-.toolbar .count{font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
-.search{flex:1;position:relative;min-width:120px}
-.search input{padding:7px 11px 7px 30px;font-size:12.5px}
-.search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);width:13px;height:13px;
-  color:var(--faint);pointer-events:none}
-.seg{display:flex;background:var(--surface-2);border:1px solid var(--border);border-radius:999px;
-  padding:2px;flex-shrink:0}
-.seg button{border:none;background:transparent;color:var(--dim);font-size:11px;font-weight:600;
-  padding:6px 11px;border-radius:999px;cursor:pointer;font-family:inherit;white-space:nowrap}
-.seg button.on{background:var(--primary);color:#fff}
-.seg button:disabled{opacity:.5;cursor:not-allowed}
-
-.strip{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-  padding:11px 14px;flex-shrink:0;display:none}
-.strip.on{display:block;animation:fadeIn .25s ease}
-
-.selbar .row1{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-.selbar .txt{flex:1;min-width:200px;font-size:12.5px;color:var(--text)}
-.selbar .txt b{font-variant-numeric:tabular-nums}
-.selbar .warn-note{color:var(--warn);display:block;font-size:11.5px;margin-top:2px}
-.selbar .actions{display:flex;gap:8px;flex-wrap:wrap}
-.selbar .btn{width:auto;padding:9px 15px;font-size:12.5px}
-.selbar.empty .txt{color:var(--dim)}
-
-.activity-top{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px}
-.activity-top .phase{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--text)}
-.activity-top .cnt{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
-.bar{width:100%;height:6px;background:var(--input);border-radius:3px;overflow:hidden}
-.fill{height:100%;border-radius:3px;width:0%;transition:width .4s ease;
-  background:linear-gradient(90deg,#7c3aed,#ec4899)}
-.fill.ind{width:30%;animation:ind 1.2s ease-in-out infinite}
-@keyframes ind{0%{transform:translateX(-100%)}100%{transform:translateX(400%)}}
-@keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
-.activity-bottom{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:8px}
-.activity-bottom .cur{font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
-.banner{border-radius:var(--radius);padding:11px 14px;font-size:12.5px;flex-shrink:0;display:none}
-.banner.on{display:block;animation:fadeIn .3s ease}
-.banner.ok{background:var(--ok-bg);border:1px solid rgba(16,185,129,.25);color:var(--ok)}
-.banner.cancel{background:var(--warn-bg);border:1px solid rgba(245,158,11,.25);color:var(--warn)}
-
-.list-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-  overflow:hidden;display:flex;flex-direction:column;min-height:0;flex:1}
-.list-head{display:grid;grid-template-columns:30px 1fr 118px 78px;gap:10px;align-items:center;
-  padding:8px 14px;border-bottom:1px solid var(--border);background:var(--surface-2);flex-shrink:0}
-.list-head span{font-size:9.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;font-weight:700}
-.list-head .chk-all{width:15px;height:15px;accent-color:var(--primary);cursor:pointer}
-.list-head .chk-all:disabled{cursor:not-allowed}
-
-.list{flex:1;overflow-y:auto;min-height:0}
-.empty-note{padding:32px 20px;text-align:center;color:var(--dim);font-size:12.5px}
-.row{display:grid;grid-template-columns:30px 1fr 118px 78px;gap:10px;align-items:center;
-  padding:9px 14px;border-bottom:1px solid var(--border);transition:background .12s}
-.row:last-child{border-bottom:none}
-.row:hover{background:var(--surface-2)}
-.row.checked{background:var(--primary-glow)}
-.row input[type=checkbox]{width:15px;height:15px;accent-color:var(--primary);cursor:pointer}
-.row input[type=checkbox]:disabled{cursor:not-allowed}
-.row .meta{min-width:0}
-.row .title{font-size:12.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.row .artist{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
-.pill{display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border-radius:999px;
-  font-size:10px;font-weight:700;white-space:nowrap;letter-spacing:.2px}
-.pill.new{background:var(--primary-glow);color:var(--primary-h)}
-.pill.disk{background:var(--info-bg);color:var(--info)}
-.pill.ym{background:var(--ok-bg);color:var(--ok)}
-.pill.busy{background:var(--warn-bg);color:var(--warn)}
-.pill.err{background:var(--err-bg);color:var(--err)}
-.pill .spin{width:8px;height:8px;border-radius:50%;border:1.5px solid currentColor;
-  border-top-color:transparent;animation:spin .7s linear infinite;flex-shrink:0}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-.skip{background:none;border:none;color:var(--faint);cursor:pointer;font-size:10.5px;
-  padding:4px 6px;border-radius:6px;font-family:inherit;white-space:nowrap;justify-self:end}
-.skip:hover:not(:disabled){color:var(--dim);background:var(--surface-2)}
-.skip:disabled{cursor:not-allowed;opacity:.4}
-
-.btn-more{width:100%;padding:8px;border:none;background:transparent;color:var(--primary);
-  font-size:11.5px;cursor:pointer;border-top:1px solid var(--border);flex-shrink:0;font-family:inherit}
-.btn-more:hover:not(:disabled){background:var(--surface-2)}
-
-.drawer{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
-  overflow:hidden;flex-shrink:0}
-.drawer summary{list-style:none;cursor:pointer;padding:9px 14px;display:flex;align-items:center;
-  gap:8px;font-size:11.5px;color:var(--dim);font-weight:600}
-.drawer summary::-webkit-details-marker{display:none}
-.drawer summary .chev{transition:transform .15s;width:10px;height:10px;flex-shrink:0}
-.drawer[open] summary .chev{transform:rotate(90deg)}
-.drawer summary .n{margin-left:auto;background:var(--surface-2);border-radius:999px;padding:2px 8px;
-  font-size:10px;font-variant-numeric:tabular-nums}
-.logbody{padding:0 14px 10px;font-family:ui-monospace,'SF Mono','Fira Code',monospace;font-size:11px;
-  max-height:150px;overflow-y:auto}
-.logline{display:flex;gap:8px;padding:2px 0;color:var(--dim)}
-.logline time{color:var(--faint);flex-shrink:0}
-.logline.ok{color:var(--ok)}
-.logline.err{color:var(--err)}
-
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(80px);
-  background:var(--primary);color:#fff;padding:8px 18px;border-radius:8px;
-  font-size:12.5px;font-weight:500;transition:transform .3s ease;z-index:99;pointer-events:none;
-  box-shadow:0 8px 24px rgba(0,0,0,.35)}
-.toast.show{transform:translateX(-50%) translateY(0)}
-
-@media(max-width:880px){
-  body{height:auto;overflow:auto}
-  .shell{height:auto}
-  .layout{grid-template-columns:1fr;max-width:560px;margin:0 auto}
-  .rail{overflow-y:visible}
-  .list{max-height:420px}
-}
-</style>
-</head>
-<body>
-<div class="shell">
-
-<div class="topbar">
-  <h1>&#9835; Музыкальный</h1>
-  <span>SoundCloud &rarr; Яндекс Музыка</span>
-</div>
-
-<div class="layout">
-
-  <div class="rail">
-    <div class="card">
-      <h2><span class="dot"></span> Источник &mdash; SoundCloud</h2>
-      <div class="field">
-        <label for="sc">Имя пользователя</label>
-        <input type="text" id="sc" placeholder="username" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="statgrid">
-        <span class="new-flag" id="s-new"></span>
-        <div class="stat"><b id="s-total">&mdash;</b><span>Всего</span></div>
-        <div class="stat"><b id="s-uploaded">&mdash;</b><span>В ЯМ</span></div>
-        <div class="stat"><b id="s-size">&mdash;</b><span>На диске</span></div>
-      </div>
-      <div class="syncline" id="sync-line"></div>
-      <div class="rowbtns">
-        <button class="btn btn-p" id="btn-scan" onclick="doScan()" style="flex:1">&#128269; Проверить</button>
-        <button class="btn btn-s btn-auto" onclick="openFolder()" title="Открыть папку">&#128194;</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2><span class="dot" style="background:var(--ok)"></span> Назначение &mdash; Яндекс Музыка</h2>
-      <div id="ym-auth"><div class="authpill wait">&#8635; Проверка&hellip;</div></div>
-      <div class="field">
-        <label for="pl">URL плейлиста</label>
-        <input type="url" id="pl" placeholder="https://music.yandex.ru/playlists/..." autocomplete="off">
-      </div>
-      <div class="rowbtns">
-        <button class="btn btn-s" onclick="checkYM()">Обновить статус</button>
-        <button class="btn btn-s" onclick="checkPlaylist(this)" title="Сравнить локальную базу с плейлистом">Сверить плейлист</button>
-        <button class="btn btn-s btn-auto" onclick="openPlaylist()" title="Открыть плейлист">&#8599;</button>
-      </div>
-      <button class="btn btn-s" id="btn-up" onclick="doUpload()" style="margin-top:8px">&#11014; Загрузить всё «На диске»</button>
-      <div class="hint">Отправляет в плейлист все скачанные, но ещё не загруженные треки &mdash; не привязано к выбору в списке справа.</div>
-    </div>
-  </div>
-
-  <div class="worklist">
-
-    <div class="toolbar">
-      <h2>Треки</h2>
-      <span class="count" id="track-count">&mdash;</span>
-      <div class="search">
-        <svg viewBox="0 0 20 20" fill="none"><circle cx="9" cy="9" r="6.5" stroke="currentColor" stroke-width="1.6"/><path d="M18 18l-4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-        <input type="text" id="track-filter" placeholder="Найти трек или исполнителя&hellip;" oninput="onFilter()">
-      </div>
-      <div class="seg" id="seg">
-        <button class="on" data-f="all" onclick="setFilterMode('all')">Все</button>
-        <button data-f="new" onclick="setFilterMode('new')">Новые</button>
-        <button data-f="pending" onclick="setFilterMode('pending')">Не в ЯМ</button>
-      </div>
-    </div>
-
-    <div class="strip selbar empty on" id="selbar">
-      <div class="row1">
-        <div class="txt" id="selbar-txt">Ничего не выбрано &mdash; отметь треки галочкой, чтобы скачать или отправить в Яндекс Музыку.</div>
-        <div class="actions" id="selbar-actions" style="display:none">
-          <button class="btn btn-ghost" id="btn-mark" onclick="doMarkUploaded()">&#10003; Уже в ЯМ</button>
-          <button class="btn btn-s" id="btn-dl" onclick="doStart(false)">&#11015; Скачать</button>
-          <button class="btn btn-p" id="btn-dlup" onclick="doStart(true)">&#11015;&#11014; Скачать и в ЯМ</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="strip" id="activity">
-      <div class="activity-top">
-        <span class="phase" id="act-phase">&mdash;</span>
-        <span class="cnt" id="act-cnt"></span>
-      </div>
-      <div class="bar"><div class="fill" id="act-fill"></div></div>
-      <div class="activity-bottom">
-        <span class="cur" id="act-cur"></span>
-        <button class="btn btn-stop btn-auto" id="btn-cancel" onclick="doCancel()">&#9632; Остановить</button>
-      </div>
-    </div>
-
-    <div class="banner ok" id="banner-ok"></div>
-    <div class="banner cancel" id="banner-cancel"></div>
-
-    <div class="list-card">
-      <div class="list-head">
-        <input type="checkbox" class="chk-all" id="chk-all" title="Выбрать/снять все по фильтру" onchange="toggleAll()">
-        <span>Трек</span>
-        <span>Статус</span>
-        <span></span>
-      </div>
-      <div class="list" id="track-list"></div>
-      <button class="btn-more" id="btn-more" onclick="showMore()" style="display:none">Показать ещё</button>
-    </div>
-
-    <details class="drawer" id="drawer">
-      <summary>
-        <svg class="chev" viewBox="0 0 20 20" fill="none"><path d="M7 4l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        Журнал операции
-        <span class="n" id="log-n">0</span>
-      </summary>
-      <div class="logbody" id="log"></div>
-    </details>
-
-  </div>
-</div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<script>
-let sse=null,busy=false;
-let allTracks=[];
-const checked=new Set();
-const liveStatus=new Map();
-let filterMode='all',query='',visibleCount=0,logCount=0;
-const PAGE=30;
-const $=id=>document.getElementById(id);
-
-const PILL={
-  pending:{cls:'new',text:'Новый'},
-  downloaded:{cls:'disk',text:'На диске'},
-  uploaded:{cls:'ym',text:'В ЯМ'},
-  not_in_likes:{cls:'disk',text:'Пропал из лайков'},
-  dl_busy:{cls:'busy',text:'Скачивается'},
-  ym_busy:{cls:'busy',text:'Отправка в ЯМ'},
-  err:{cls:'err',text:'Ошибка'},
-};
-
-document.addEventListener('DOMContentLoaded',()=>{
-  loadStatus();checkYM();connectSSE();loadTracks();
-  function debounceSave(){if(_saveTimer)clearTimeout(_saveTimer);_saveTimer=setTimeout(()=>save(false),800)}
-  $('sc').addEventListener('input',debounceSave);
-  $('pl').addEventListener('input',debounceSave);
-});
-
-async function loadTracks(){
-  // Список из локальной базы при старте — без скана SoundCloud.
-  if(busy) return;
-  try{
-    const r=await fetch('/api/tracks');
-    const d=await r.json();
-    if(busy || allTracks.length) return; // скан успел отработать — не затираем
-    if(d.tracks && d.tracks.length){allTracks=d.tracks;render()}
-  }catch(e){console.error(e)}
-}
-
-async function loadTracksFresh(){
-  // Перечитать базу после пропущенных событий (обрыв SSE) — статусы могли измениться.
-  try{
-    const d=await (await fetch('/api/tracks')).json();
-    if(d.tracks){allTracks=d.tracks;liveStatus.clear();render()}
-  }catch(e){console.error(e)}
-}
-
-async function loadStatus(){
-  try{
-    const r=await fetch('/api/status'),d=await r.json();
-    $('sc').value=d.username||'';
-    $('pl').value=d.playlist_url||'';
-    showStats(d.stats);
-    if(d.active_task){
-      setBusy(true);
-      showActivity(d.active_task==='scan'?'Сканирование SoundCloud':
-        d.active_task==='upload'?'Загрузка в Яндекс Музыку':'Выполняется задача');
-      indeterminate();
-    }
-  }catch(e){console.error(e)}
-}
-function showStats(s){
-  if(!s)return;
-  $('s-total').textContent=s.total;
-  $('s-uploaded').textContent=s.uploaded;
-  $('s-size').textContent=s.size_mb>0?(s.size_mb>=1024?(s.size_mb/1024).toFixed(1)+' ГБ':s.size_mb+' МБ'):'0';
-  const sl=$('sync-line');
-  if(s.total>0){
-    if(s.pending>0||s.downloaded>0){
-      let p=[];
-      if(s.downloaded>0) p.push(s.downloaded+' на диске');
-      if(s.pending>0) p.push(s.pending+' новых');
-      sl.className='syncline warn';
-      sl.innerHTML='<b>'+s.uploaded+'</b> в ЯМ &middot; '+p.join(' &middot; ');
-    }else{
-      sl.className='syncline';
-      sl.innerHTML='&#10003; Все <b>'+s.total+'</b> в Яндекс Музыке';
-    }
-  }else{sl.textContent='Ещё не сканировали'}
-}
-
-let _saveTimer=null;
-async function save(silent){
-  if(_saveTimer){clearTimeout(_saveTimer);_saveTimer=null}
-  try{
-    await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({username:$('sc').value,playlist_url:$('pl').value})});
-    if(!silent) toast('Сохранено');
-  }catch(e){console.error(e)}
-}
-function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
-
-async function checkYM(){
-  const el=$('ym-auth');
-  el.innerHTML='<div class="authpill wait">&#8635; Проверка&hellip;</div>';
-  try{const r=await fetch('/api/check-yandex'),d=await r.json();
-    el.innerHTML=d.authorized
-      ?`<div class="authpill ok">&#10003; ${escapeHtml(d.login||'')}</div>`
-      :`<div class="authpill fail">&#10007; ${escapeHtml(d.error||'Не авторизован')}</div>`;
-  }catch(e){el.innerHTML='<div class="authpill fail">&#10007; Ошибка проверки</div>'}
-}
-
-async function checkPlaylist(btn){
-  btn.disabled=true;const old=btn.textContent;btn.textContent='Сверяю…';
-  try{
-    const r=await fetch('/api/check-playlist',{method:'POST'});
-    const d=await r.json();
-    if(d.error){toast(d.error);return}
-    let msg=`В плейлисте ${d.playlist_total} трек(ов). Найдено ${d.found} из ${d.found+d.missing_total} локальных «в ЯМ».`;
-    if(d.processing)msg+=` Ещё обрабатывается: ${d.processing}.`;
-    if(d.duplicates)msg+=` Дублей по названию: ${d.duplicates}.`;
-    log(msg);
-    if(d.missing_total){
-      log(`Не найдено по названию (${d.missing_total}): `+d.missing.slice(0,10)
-        .map(t=>(t.artist?t.artist+' — ':'')+t.title).join('; ')+(d.missing_total>10?' …':''), 'err');
-    }
-    toast(d.missing_total?`Не найдено: ${d.missing_total} (см. журнал)`:'Все локальные треки на месте');
-    $('drawer').open=true;
-  }catch(e){toast('Ошибка сверки')}
-  finally{btn.disabled=false;btn.textContent=old}
-}
-
-function openPlaylist(){
-  const url=$('pl').value.trim();
-  if(url) window.open(url,'_blank');
-  else toast('Введите URL плейлиста');
-}
-
-function connectSSE(){
-  if(sse)sse.close();
-  sse=new EventSource('/api/progress');
-  sse.onmessage=e=>handleEvent(JSON.parse(e.data));
-  sse.onerror=()=>setTimeout(connectSSE,3000);
-}
-
-function resetLog(){
-  $('log').innerHTML='';logCount=0;$('log-n').textContent='0';$('drawer').open=false;
-  $('banner-ok').classList.remove('on');$('banner-cancel').classList.remove('on');
-}
-
-function resetTracks(){
-  allTracks=[];checked.clear();liveStatus.clear();
-  filterMode='all';query='';visibleCount=PAGE;
-  $('track-filter').value='';
-  document.querySelectorAll('#seg button').forEach(b=>b.classList.toggle('on',b.dataset.f==='all'));
-  $('s-new').classList.remove('on');
-}
-
-function visibleTracks(){
-  return allTracks.filter(t=>{
-    if(filterMode==='new' && t.status!=='pending') return false;
-    if(filterMode==='pending' && t.status==='uploaded') return false;
-    if(query && !(t.title+' '+t.artist).toLowerCase().includes(query)) return false;
-    return true;
-  });
-}
-
-function pillHtml(id,baseStatus){
-  const live=liveStatus.get(id);
-  const key=live||baseStatus;
-  const p=PILL[key]||PILL.pending;
-  const spin=(key==='dl_busy'||key==='ym_busy')?'<span class="spin"></span>':'';
-  return `<span class="pill ${p.cls}">${spin}${p.text}</span>`;
-}
-
-function render(){
-  const filtered=visibleTracks();
-  const slice=filtered.slice(0,visibleCount);
-  const list=$('track-list');
-
-  if(!allTracks.length){
-    list.innerHTML='<div class="empty-note">Пока пусто. Нажми «Проверить», чтобы получить список лайков с SoundCloud.</div>';
-  }else if(!filtered.length){
-    list.innerHTML='<div class="empty-note">Ничего не подходит под фильтр.</div>';
-  }else{
-    list.innerHTML=slice.map(t=>{
-      const isChecked=checked.has(t.id);
-      const canSkip=t.status!=='uploaded';
-      return `<div class="row${isChecked?' checked':''}" data-id="${t.id}">
-        <input type="checkbox" ${isChecked?'checked':''} data-chk="${t.id}" ${busy?'disabled':''}>
-        <div class="meta">
-          <div class="title">${escapeHtml(t.title)}</div>
-          <div class="artist">${escapeHtml(t.artist||'')}</div>
-        </div>
-        <div class="pillwrap" data-pill="${t.id}">${pillHtml(t.id,t.status)}</div>
-        <div>${canSkip?`<button class="skip" data-skip="${t.id}" ${busy?'disabled':''}>Уже в ЯМ</button>`:''}</div>
-      </div>`;
-    }).join('');
-  }
-
-  const newCount=allTracks.filter(t=>t.status==='pending').length;
-  $('track-count').textContent=allTracks.length?(filtered.length+' из '+allTracks.length+' · '+newCount+' новых'):'';
-
-  const more=$('btn-more');
-  if(visibleCount<filtered.length){
-    more.style.display='';
-    more.textContent='Показать ещё '+Math.min(PAGE,filtered.length-visibleCount)+' из '+(filtered.length-visibleCount);
-  }else{more.style.display='none'}
-
-  $('chk-all').checked=filtered.length>0 && filtered.every(t=>checked.has(t.id));
-  $('chk-all').disabled=busy || !filtered.length;
-
-  renderSelbar();
-}
-
-function escapeHtml(s){
-  return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-function renderSelbar(){
-  const sel=allTracks.filter(t=>checked.has(t.id));
-  const bar=$('selbar'),txt=$('selbar-txt'),actions=$('selbar-actions');
-  if(!sel.length){
-    bar.classList.add('empty');actions.style.display='none';
-    txt.textContent='Ничего не выбрано — отметь треки галочкой, чтобы скачать или отправить в Яндекс Музыку.';
-    return;
-  }
-  bar.classList.remove('empty');actions.style.display='flex';
-  const nNew=sel.filter(t=>t.status==='pending').length;
-  const nDisk=sel.filter(t=>t.status==='downloaded').length;
-  const nYm=sel.filter(t=>t.status==='uploaded').length;
-  let parts=[];
-  if(nNew) parts.push(nNew+' новых');
-  if(nDisk) parts.push(nDisk+' на диске');
-  if(nYm) parts.push(nYm+' уже в ЯМ');
-  let html=`Выбрано <b>${sel.length}</b>: ${parts.join(', ')}.`;
-  if(nYm) html+=`<span class="warn-note">&#9888; ${nYm===1?'Этот трек уже':'Эти треки уже'} в плейлисте — повторная отправка добавит дубль.</span>`;
-  txt.innerHTML=html;
-}
-
-function setFilterMode(m){
-  filterMode=m;visibleCount=PAGE;
-  document.querySelectorAll('#seg button').forEach(b=>b.classList.toggle('on',b.dataset.f===m));
-  render();
-}
-
-function onFilter(){
-  query=$('track-filter').value.trim().toLowerCase();
-  visibleCount=PAGE;
-  render();
-}
-
-function showMore(){
-  visibleCount=Math.min(visibleCount+PAGE,visibleTracks().length);
-  render();
-}
-
-function toggleAll(){
-  const filtered=visibleTracks();
-  const allOn=filtered.length>0 && filtered.every(t=>checked.has(t.id));
-  filtered.forEach(t=> allOn ? checked.delete(t.id) : checked.add(t.id));
-  render();
-}
-
-$('track-list').addEventListener('change',e=>{
-  if(e.target.matches('[data-chk]')){
-    const id=e.target.dataset.chk;
-    e.target.checked?checked.add(id):checked.delete(id);
-    e.target.closest('.row').classList.toggle('checked',e.target.checked);
-    renderSelbar();
-    $('chk-all').checked=visibleTracks().every(t=>checked.has(t.id));
-  }
-});
-$('track-list').addEventListener('click',e=>{
-  if(e.target.matches('[data-skip]')) markOne(e.target.dataset.skip,e.target);
-});
-
-async function markOne(id,btn){
-  if(busy)return;
-  btn.disabled=true;
-  try{
-    const r=await fetch('/api/mark-uploaded',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({track_ids:[id]})});
-    const d=await r.json();
-    if(d.ok){
-      const t=allTracks.find(x=>x.id===id);
-      if(t) t.status='uploaded';
-      checked.delete(id);
-      render();toast('Отмечен');loadStatus();
-    }else{toast(d.error||'Ошибка');btn.disabled=false}
-  }catch(e){toast('Ошибка');btn.disabled=false}
-}
-
-function updatePill(id){
-  const el=document.querySelector(`[data-pill="${id}"]`);
-  const t=allTracks.find(x=>x.id===id);
-  if(el && t) el.innerHTML=pillHtml(id,t.status);
-}
-
-function showActivity(phase){
-  $('activity').classList.add('on');
-  $('act-phase').textContent=phase;
-  $('act-cnt').textContent='';$('act-cur').textContent='';
-  $('btn-cancel').style.display='';
-}
-function hideActivity(){$('activity').classList.remove('on')}
-function indeterminate(){$('act-fill').className='fill ind';$('act-fill').style.width='30%'}
-function progressTo(done,total){
-  $('act-fill').className='fill';
-  $('act-fill').style.width=(total?Math.min(99,Math.round(done/total*100)):0)+'%';
-  $('act-cnt').textContent=done+'/'+total;
-}
-
-function handleEvent(d){
-  switch(d.type){
-    case 'scanning':
-      resetLog();resetTracks();render();
-      showActivity('Сканирование SoundCloud');indeterminate();
-      $('btn-cancel').style.display='none';
-      setBusy(true);
-      break;
-
-    case 'scan_complete':
-      hideActivity();
-      allTracks=d.all_tracks||[];
-      visibleCount=PAGE;
-      if(d.new_count>0){$('s-new').textContent='+'+d.new_count+' новых';$('s-new').classList.add('on')}
-      else{$('s-new').classList.remove('on')}
-      if(!allTracks.length) toast('Треков не найдено');
-      render();
-      setBusy(false);
-      break;
-
-    case 'dl_start':
-      showActivity('Скачивание с SoundCloud');
-      progressTo(0,d.total);
-      break;
-
-    case 'downloading':
-      if(d.id){liveStatus.set(d.id,'dl_busy');updatePill(d.id)}
-      progressTo(d.downloaded,d.total);
-      $('act-cur').textContent='♪ '+d.title;
-      break;
-
-    case 'track_done':{
-      progressTo(d.downloaded,d.total);
-      if(d.id){
-        liveStatus.delete(d.id);
-        const t=allTracks.find(x=>x.id===d.id);
-        if(t) t.status=d.status||'downloaded';
-        updatePill(d.id);
-      }
-      log('✓ '+d.title,'ok');
-      break;
-    }
-
-    case 'dl_complete':
-      $('act-cur').textContent='';
-      break;
-
-    case 'upload_start':
-      showActivity('Загрузка в Яндекс Музыку');
-      progressTo(0,d.total);
-      break;
-
-    case 'uploading':
-      if(d.id){liveStatus.set(d.id,'ym_busy');updatePill(d.id)}
-      progressTo(d.uploaded,d.total);
-      $('act-cur').textContent='↑ '+d.title;
-      break;
-
-    case 'track_uploaded':
-      if(d.id){
-        liveStatus.delete(d.id);
-        const t=allTracks.find(x=>x.id===d.id);
-        if(t) t.status='uploaded';
-        checked.delete(d.id);
-        render();
-      }
-      break;
-
-    case 'all_done':{
-      hideActivity();
-      $('s-new').classList.remove('on');
-      let t='';
-      if(d.downloaded>0) t+='Скачано: '+d.downloaded;
-      if(d.failures) t+=(t?' · ':'')+'Ошибок скачивания: '+d.failures;
-      if(d.uploaded>0) t+=(t?' · ':'')+'В ЯМ: '+d.uploaded;
-      if(d.upload_errors) t+=(t?' · ':'')+'Ошибок загрузки: '+d.upload_errors;
-      if(d.message) t+=(t?' · ':'')+d.message;
-      const bad=d.level==='error'||d.level==='warn';
-      if(d.level==='error') log(d.message,'err');
-      $(bad?'banner-cancel':'banner-ok').textContent=t||'Готово';
-      $(bad?'banner-cancel':'banner-ok').classList.add('on');
-      setBusy(false);loadStatus();
-      break;
-    }
-
-    case 'cancelled':{
-      hideActivity();
-      $('s-new').classList.remove('on');
-      let t='Остановлено';
-      if(d.downloaded) t+=' · Скачано: '+d.downloaded;
-      if(d.uploaded) t+=' · Загружено: '+d.uploaded;
-      $('banner-cancel').textContent=t;
-      $('banner-cancel').classList.add('on');
-      setBusy(false);loadStatus();
-      break;
-    }
-
-    case 'error':
-      log(d.message,'err');
-      toast(d.message.length>60?d.message.slice(0,60)+'…':d.message);
-      hideActivity();setBusy(false);loadStatus();
-      break;
-    case 'hello':
-      // (Пере)подключение к SSE: если задача уже закончилась, пока связи не было, — снимаем «занято».
-      if(!d.active_task && busy){hideActivity();setBusy(false);loadStatus();loadTracksFresh()}
-      break;
-    case 'log':
-      log(d.message,d.level==='error'?'err':'');
-      if(d.id && d.level==='error'){liveStatus.set(d.id,'err');updatePill(d.id)}
-      break;
-  }
-}
-
-function log(msg,cls){
-  const body=$('log');
-  const el=document.createElement('div');
-  el.className='logline'+(cls?' '+cls:'');
-  const t=new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  el.innerHTML=`<time>${t}</time><span>${escapeHtml(msg)}</span>`;
-  body.appendChild(el);body.scrollTop=body.scrollHeight;
-  logCount++;$('log-n').textContent=logCount;
-  if(cls==='err') $('drawer').open=true;
-}
-
-function setBusy(v){
-  busy=v;
-  $('btn-scan').disabled=v;
-  $('btn-up').disabled=v;
-  $('track-filter').disabled=v;
-  $('btn-more').disabled=v;
-  document.querySelectorAll('#seg button').forEach(b=>b.disabled=v);
-  $('selbar').classList.toggle('on',!v);
-  render();
-  if(!v) $('btn-cancel').style.display='none';
-}
-
-async function doScan(){
-  if(busy)return;
-  await save(true);
-  if(!$('sc').value.trim()){toast('Введите имя SoundCloud');$('sc').focus();return}
-  try{const r=await fetch('/api/scan',{method:'POST'});
-    if(!r.ok){
-      const e=await r.json();
-      if(r.status===409){
-        toast('Задача уже выполняется — нажмите «Остановить» для сброса');
-        setBusy(true);showActivity(e.error||'Задача выполняется');indeterminate();
-      }else{toast(e.error||'Ошибка')}
-    }
-  }catch(e){toast('Ошибка')}
-}
-
-async function doStart(upload){
-  if(busy)return;
-  const ids=[...checked];
-  if(!ids.length){toast('Выберите треки');return}
-  setBusy(true);resetLog();
-  try{const r=await fetch('/api/start',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({upload:!!upload,track_ids:ids})});
-    if(!r.ok){const e=await r.json();toast(e.error||'Ошибка');setBusy(false)}
-  }catch(e){toast('Ошибка');setBusy(false)}
-}
-
-async function doCancel(){
-  try{await fetch('/api/cancel',{method:'POST'})}catch(e){}
-  $('act-cur').textContent='Останавливаем… (дожидаюсь конца текущего трека)';
-  let tries=0;
-  const poll=async()=>{
-    try{
-      const d=await (await fetch('/api/status')).json();
-      if(!d.active_task){if(busy){hideActivity();setBusy(false);loadStatus()}return}
-      // Сервер откажет (409), пока поток задачи жив, — это нормально, ждём дальше.
-      if(++tries%5===0) await fetch('/api/force-clear',{method:'POST'});
-    }catch(e){}
-    setTimeout(poll,2000);
-  };
-  setTimeout(poll,2000);
-}
-
-async function doUpload(){
-  if(busy)return;
-  await save(true);
-  if(!$('pl').value.trim()){toast('Введите URL плейлиста');$('pl').focus();return}
-  setBusy(true);resetLog();
-  showActivity('Загрузка в Яндекс Музыку');indeterminate();
-  try{const r=await fetch('/api/upload',{method:'POST'});
-    if(!r.ok){const e=await r.json();toast(e.error||'Ошибка');setBusy(false);hideActivity()}
-  }catch(e){toast('Ошибка');setBusy(false);hideActivity()}
-}
-
-async function openFolder(){
-  try{await fetch('/api/open-folder',{method:'POST'})}catch(e){toast('Ошибка')}
-}
-
-async function doMarkUploaded(){
-  if(busy)return;
-  const ids=[...checked];
-  if(!ids.length){toast('Выберите треки');return}
-  if(!confirm('Пометить '+ids.length+' треков как уже загруженные в ЯМ?'))return;
-  try{
-    const r=await fetch('/api/mark-uploaded',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({track_ids:ids})});
-    const d=await r.json();
-    if(d.ok){
-      ids.forEach(id=>{const t=allTracks.find(x=>x.id===id);if(t)t.status='uploaded';checked.delete(id)});
-      render();toast('Отмечено: '+d.marked);loadStatus();
-    }else{toast(d.error||'Ошибка')}
-  }catch(e){toast('Ошибка')}
-}
-
-render();
-</script>
-</body>
-</html>"""
-
 # ── Entry point ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     _migrate_json_to_csv()
     _cleanup_stale_paths()
     _cleanup_partials()
-    port = 5555
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    threading.Thread(target=_scheduler_loop, daemon=True, name="autosync").start()
+    threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)

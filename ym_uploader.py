@@ -92,6 +92,16 @@ def _record_uploaded(path: Path, filepath: Path) -> None:
         f.write(entry + "\n")
 
 
+def _forget_uploaded(path: Path, names: Set[str]) -> int:
+    """Убирает файлы (по имени) из архива загрузок — чтобы их можно было загрузить снова."""
+    if not path.exists() or not names:
+        return 0
+    lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    keep = [ln for ln in lines if Path(ln).name not in names]
+    path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+    return len(lines) - len(keep)
+
+
 def _wait(seconds: float, cancel_event=None) -> None:
     """Пауза, которую прерывает «Остановить» (threading.Event) — тогда RuntimeError."""
     if cancel_event is None:
@@ -424,6 +434,24 @@ def _playlist_track_count(
     except (requests.exceptions.RequestException, ValueError, TypeError):
         pass
     return None
+
+
+def get_playlist_info(
+    session: requests.Session, uid: int, kind: str, token: str
+) -> dict:
+    """Название, число треков и владелец плейлиста — для проверки ссылки в настройках."""
+    pl = _api_get_result(session, f"{API_BASE}/users/{uid}/playlists/{kind}", token, uid)
+    if not isinstance(pl, dict):
+        raise RuntimeError(f"Плейлист {kind} не найден в вашем аккаунте Яндекс Музыки")
+    count = pl.get("trackCount")
+    if count is None and isinstance(pl.get("tracks"), list):
+        count = len(pl["tracks"])
+    return {
+        "kind": str(kind),
+        "title": pl.get("title") or "",
+        "track_count": count,
+        "owner": (pl.get("owner") or {}).get("login") or "",
+    }
 
 
 def get_playlist_tracks(

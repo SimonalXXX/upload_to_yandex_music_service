@@ -15,3 +15,5 @@ tracks.tmp
 .venv/
 .backup/
 диагностика_отчет.txt
+history.json
+*.tmp
