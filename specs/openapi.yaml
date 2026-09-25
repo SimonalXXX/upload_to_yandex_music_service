@@ -4,7 +4,7 @@ info:
   description: |
     REST API веб-приложения (`web_app.py`). Сервер слушает только 127.0.0.1.
     Поток прогресса — отдельный контракт GET `/api/progress`, см. `sse-events.md`.
-  version: "1.0.0"
+  version: "1.1.0"
 
 servers:
   - url: http://127.0.0.1:5555
@@ -69,7 +69,12 @@ paths:
 
   /api/start:
     post:
-      summary: Скачать выбранные новые треки (опционально с загрузкой в ЯМ)
+      summary: Скачать выбранные треки (опционально с загрузкой в ЯМ)
+      description: |
+        Треки берутся из локальной базы `tracks.csv` (по `sc_url`), предварительный
+        скан не нужен — после перезапуска приложения скачивание доступно сразу.
+        Без `track_ids` скачиваются все треки со статусом `pending`.
+        Отсутствие подходящих треков сообщается событием SSE `error`, не HTTP-кодом.
       operationId: apiStart
       requestBody:
         content:
@@ -84,13 +89,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/OkResponse"
         "400":
-          description: Нет результатов скана или новых треков
+          description: track_ids передан, но не является списком
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "409":
-          description: Занято
+          description: Занято (выполняется задача или предыдущая ещё останавливается)
           content:
             application/json:
               schema:
@@ -117,7 +122,9 @@ paths:
   /api/cancel:
     post:
       summary: Запросить отмену текущей задачи
-      description: Устанавливает флаг отмены; сброс active_task — в воркере или через force-clear.
+      description: |
+        Устанавливает флаг отмены; active_task сбрасывает сам воркер, когда остановится
+        (текущий шаг ffmpeg дорабатывает до конца). Итог — событие SSE `cancelled`.
       operationId: apiCancel
       responses:
         "200":
@@ -128,7 +135,10 @@ paths:
 
   /api/force-clear:
     post:
-      summary: Принудительно сбросить активную задачу
+      summary: Аварийно сбросить «зависшую» активную задачу
+      description: |
+        Сбрасывает active_task, только если поток задачи уже завершён. Пока он жив —
+        409: иначе новая задача стартовала бы параллельно ещё работающему воркеру.
       operationId: apiForceClear
       responses:
         "200":
@@ -143,6 +153,22 @@ paths:
                   cleared:
                     description: Имя сброшенной задачи или null
                     type: ["string", "null"]
+        "409":
+          description: Поток задачи ещё работает
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, alive, error]
+                properties:
+                  ok:
+                    type: boolean
+                    const: false
+                  alive:
+                    type: boolean
+                    const: true
+                  error:
+                    type: string
 
   /api/mark-uploaded:
     post:
@@ -180,7 +206,7 @@ paths:
 
   /api/open-folder:
     post:
-      summary: Открыть папку с музыкой в файловом менеджере ОС
+      summary: Открыть папку с музыкой в Finder
       operationId: apiOpenFolder
       responses:
         "200":
@@ -206,6 +232,56 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/YandexAuthorized"
                   - $ref: "#/components/schemas/YandexUnauthorized"
+
+  /api/tracks:
+    get:
+      summary: Все треки из локальной базы
+      description: Для показа списка сразу при загрузке страницы, без скана SoundCloud. Последние добавленные — сверху.
+      operationId: apiTracks
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tracks]
+                properties:
+                  tracks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TrackItem"
+
+  /api/check-playlist:
+    post:
+      summary: Сверить треки «в ЯМ» из локальной базы с плейлистом Яндекс Музыки
+      description: |
+        Сопоставление по нормализованным исполнителю и названию (или только названию).
+        Статусы не меняет. Плейлист должен принадлежать текущему аккаунту.
+      operationId: apiCheckPlaylist
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaylistCheck"
+        "400":
+          description: URL плейлиста не задан или плейлист не определён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Нет авторизации в ЯМ
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Ошибка API Яндекс Музыки (в т.ч. чужой плейлист)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/progress:
     get:
@@ -282,6 +358,49 @@ components:
           type: string
           nullable: true
 
+    TrackItem:
+      type: object
+      required: [id, title, artist, status]
+      properties:
+        id:
+          type: string
+          description: SoundCloud id
+        title:
+          type: string
+        artist:
+          type: string
+          description: Может быть пустым до скачивания — плоский скан лайков не отдаёт исполнителя
+        status:
+          type: string
+          enum: [pending, downloaded, uploaded, not_in_likes]
+
+    PlaylistCheck:
+      type: object
+      properties:
+        playlist_total:
+          type: integer
+        found:
+          type: integer
+        missing_total:
+          type: integer
+        missing:
+          type: array
+          description: Первые 30 ненайденных
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              title:
+                type: string
+              artist:
+                type: string
+        duplicates:
+          type: integer
+        processing:
+          type: integer
+          description: Треки плейлиста, ещё недоступные для прослушивания (обработка)
+
     StartRequest:
       type: object
       properties:
@@ -293,7 +412,7 @@ components:
           type: array
           items:
             type: string
-          description: Список sc_id выбранных треков
+          description: Список sc_id выбранных треков; не передан — все `pending`
 
     MarkUploadedRequest:
       type: object
