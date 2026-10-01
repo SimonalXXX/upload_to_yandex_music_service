@@ -13,7 +13,12 @@ info:
     **2.1.0** (`specs/features/upload-confirmation.md`): статус `sent` («Ждёт ЯМ») — ЯМ принял файл,
     но трек ещё не найден в плейлисте; поле трека `sent_at`; `stats.sent`; в отчёте сверки —
     `sent_waiting`, `confirmed_now`, `expired_now`; в итогах загрузки — `sent`.
-  version: "2.1.0"
+
+    **3.0.0** (`specs/features/track-states.md`, ломающее): у трека вместо `status` — три признака:
+    `has_file` (диск), `ym` (+ `ym_checked_at`, `sent_at`), `liked` + `sc` (+ `sc_reason`); статистика
+    по признакам; сверка записывает результат в `ym` и отдаёт `missing`/`rejected`/`sent_waiting` и
+    `changes`. Миграция: клиент один — встроенный интерфейс, обновлён в том же релизе.
+  version: "3.0.0"
 
 servers:
   - url: http://127.0.0.1:5555
@@ -347,8 +352,10 @@ paths:
 
   /api/mark-uploaded:
     post:
-      summary: Пометить треки как уже загруженные в ЯМ
-      description: Переводит `pending`, `downloaded`, `sent`, `not_in_likes`, `unavailable` → `uploaded`.
+      summary: «Уже в ЯМ»
+      description: |
+        `ym`: `none`/`sent` → `manual` (проверится при сверке); `missing`/`rejected` → `pinned`
+        (в ЯМ по подтверждению пользователя — проверка его не меняет). `confirmed`/`manual`/`pinned` не трогаются.
       operationId: apiMarkUploaded
       requestBody:
         content:
@@ -380,9 +387,9 @@ paths:
 
   /api/unmark-uploaded:
     post:
-      summary: Снять отметку «В ЯМ» (или «Ждёт ЯМ»)
+      summary: «Снять «В ЯМ»»
       description: |
-        `uploaded`/`sent` → `downloaded` (есть файл) или `pending` (нет файла); файл убирается из
+        Любое `ym` → `none` (не отправлен); файл убирается из
         `upload_archive.txt`, чтобы его можно было загрузить снова.
       operationId: apiUnmarkUploaded
       requestBody:
@@ -455,8 +462,9 @@ paths:
       summary: Сверить треки «В ЯМ» из локальной базы с плейлистом Яндекс Музыки
       description: |
         Сопоставление по нормализованным исполнителю и названию (или только названию).
-        Меняет только статусы `sent`: найден → `uploaded`; не найден дольше суток → `downloaded`/`pending`
-        с ошибкой. Плейлист должен принадлежать текущему аккаунту.
+        Записывает результат в `ym` каждого трека (кроме `none` и `pinned`): найден → `confirmed`;
+        не найден: `confirmed`/`manual` → `missing`, `sent` старше суток → `rejected`.
+        Плейлист должен принадлежать текущему аккаунту.
       operationId: apiCheckPlaylist
       responses:
         "200":
@@ -589,17 +597,21 @@ components:
 
     TrackStats:
       type: object
-      description: Агрегаты по tracks.csv + размер папки музыки
+      description: Агрегаты по tracks.csv (по признакам состояния) + размер папки музыки
       properties:
         total: { type: integer }
-        pending: { type: integer }
-        downloaded: { type: integer }
-        sent: { type: integer, description: «Ждёт ЯМ» — принят ЯМ, ещё не найден в плейлисте }
-        uploaded: { type: integer }
-        not_in_likes: { type: integer }
+        on_disk: { type: integer, description: Треки с файлом }
+        ym:
+          type: object
+          description: Число треков в каждом состоянии `ym`
+          additionalProperties: { type: integer }
+        in_ym: { type: integer, description: "ym = confirmed или pinned" }
+        not_in_ym: { type: integer }
+        new: { type: integer, description: Не скачаны, не в ЯМ, доступны, в лайках }
+        ready: { type: integer, description: Файл есть, ym = none }
+        unliked: { type: integer }
         unavailable: { type: integer }
-        not_in_ym: { type: integer, description: Все, кроме uploaded (в т.ч. sent) }
-        with_errors: { type: integer, description: С сохранённой ошибкой, кроме unavailable }
+        with_errors: { type: integer }
         local_files: { type: integer }
         size_mb: { type: number }
 
@@ -677,32 +689,30 @@ components:
 
     TrackItem:
       type: object
-      required: [id, title, artist, status, added, error, has_file, sc_url, sent_at]
+      description: Состояние трека — три независимых признака (specs/features/track-states.md)
+      required: [id, title, artist, added, sc_url, has_file, ym, ym_checked_at, sent_at, liked, sc, sc_reason, error]
       properties:
-        id:
-          type: string
-          description: SoundCloud id
-        title:
-          type: string
+        id: { type: string, description: SoundCloud id }
+        title: { type: string }
         artist:
           type: string
           description: Может быть пустым до скачивания — плоский скан лайков не отдаёт исполнителя
-        status:
+        added: { type: string, description: "Дата появления в базе, YYYY-MM-DD" }
+        sc_url: { type: string }
+        has_file: { type: boolean, description: Диск — файл есть в папке музыки }
+        ym:
           type: string
-          enum: [pending, downloaded, sent, uploaded, not_in_likes, unavailable]
-        added:
-          type: string
-          description: Дата появления в базе, YYYY-MM-DD
-        error:
-          type: string
-          description: Последняя ошибка; для unavailable — причина недоступности
-        has_file:
-          type: boolean
-        sc_url:
-          type: string
-        sent_at:
-          type: ["number", "null"]
-          description: Для `sent` — время отправки (unix); иначе null
+          enum: [none, sent, confirmed, manual, missing, rejected, pinned]
+          description: |
+            Яндекс Музыка: none не отправлен · sent ЯМ принял файл, трек ещё не в плейлисте ·
+            confirmed найден в плейлисте · manual отмечен вручную, не проверен · missing считался в ЯМ,
+            но не найден · rejected не появился за сутки · pinned в ЯМ по подтверждению пользователя
+        ym_checked_at: { type: ["number", "null"], description: Время последней проверки по плейлисту (unix) }
+        sent_at: { type: ["number", "null"], description: Для sent — время отправки (unix) }
+        liked: { type: ["boolean", "null"], description: "SoundCloud: в лайках / пропал из лайков / неизвестно" }
+        sc: { type: string, enum: [ok, unavailable], description: SoundCloud — можно ли скачать }
+        sc_reason: { type: string, description: Причина недоступности (DRM, удалён, страна) }
+        error: { type: string, description: Последняя ошибка }
 
     PlaylistReport:
       type: object
@@ -716,13 +726,31 @@ components:
             track_count: { type: ["integer", "null"] }
             owner: { type: string }
         playlist_total: { type: integer }
-        found: { type: integer }
+        found: { type: integer, description: "ym = confirmed или pinned" }
         missing_total: { type: integer }
         missing:
           type: array
-          description: Все ненайденные треки «В ЯМ»
+          description: Треки с ym = missing после этой сверки
           items:
             $ref: "#/components/schemas/TrackItem"
+        rejected:
+          type: array
+          description: Треки с ym = rejected
+          items:
+            $ref: "#/components/schemas/TrackItem"
+        sent_waiting:
+          type: array
+          description: Треки с ym = sent (ещё не найдены, сутки не прошли)
+          items:
+            $ref: "#/components/schemas/TrackItem"
+        changes:
+          type: object
+          description: Что изменила эта сверка
+          properties:
+            confirmed: { type: integer, description: Стали confirmed }
+            missing: { type: integer, description: Стали missing }
+            rejected: { type: integer, description: sent → rejected по тайм-ауту }
+            waiting: { type: integer, description: Остались sent }
         duplicates: { type: integer, description: Число лишних копий }
         duplicates_list:
           type: array
@@ -740,13 +768,6 @@ components:
             properties:
               artist: { type: string }
               title: { type: string }
-        sent_waiting:
-          type: array
-          description: Треки «Ждёт ЯМ» после этой сверки (ещё не найдены, сутки не прошли)
-          items:
-            $ref: "#/components/schemas/TrackItem"
-        confirmed_now: { type: integer, description: Сколько «Ждёт ЯМ» подтверждено этой сверкой }
-        expired_now: { type: integer, description: Сколько «Ждёт ЯМ» возвращено по тайм-ауту }
 
     HistoryRecordBase:
       type: object

@@ -13,6 +13,7 @@
 | [`templates/feature-spec.md`](./templates/feature-spec.md) | Шаблон спецификации новой возможности |
 | [`features/ui-redesign.md`](./features/ui-redesign.md) | Новый интерфейс: раскладка, синхронизация, плеер, горячие клавиши, критерии приёмки |
 | [`features/upload-confirmation.md`](./features/upload-confirmation.md) | Статус «Ждёт ЯМ»: «В ЯМ» только после появления трека в плейлисте; выделение кликом |
+| [`features/track-states.md`](./features/track-states.md) | Состояние трека по трём признакам: диск, Яндекс Музыка, SoundCloud |
 
 При противоречии приоритет такой: **спецификация API/SSE в `specs/` → код → SDD**, если явно не решено иначе в PR.
 
