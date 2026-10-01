@@ -9,7 +9,11 @@ info:
     (заменён `GET/POST /api/settings`); статус трека `unavailable`; задачи идут через общую
     обёртку с историей (`/api/history`); добавлены синхронизация, проверки при вводе,
     плеер, снятие отметки «В ЯМ».
-  version: "2.0.0"
+
+    **2.1.0** (`specs/features/upload-confirmation.md`): статус `sent` («Ждёт ЯМ») — ЯМ принял файл,
+    но трек ещё не найден в плейлисте; поле трека `sent_at`; `stats.sent`; в отчёте сверки —
+    `sent_waiting`, `confirmed_now`, `expired_now`; в итогах загрузки — `sent`.
+  version: "2.1.0"
 
 servers:
   - url: http://127.0.0.1:5555
@@ -344,7 +348,7 @@ paths:
   /api/mark-uploaded:
     post:
       summary: Пометить треки как уже загруженные в ЯМ
-      description: Переводит `pending`, `downloaded`, `not_in_likes`, `unavailable` → `uploaded`.
+      description: Переводит `pending`, `downloaded`, `sent`, `not_in_likes`, `unavailable` → `uploaded`.
       operationId: apiMarkUploaded
       requestBody:
         content:
@@ -376,9 +380,9 @@ paths:
 
   /api/unmark-uploaded:
     post:
-      summary: Снять отметку «В ЯМ»
+      summary: Снять отметку «В ЯМ» (или «Ждёт ЯМ»)
       description: |
-        `uploaded` → `downloaded` (есть файл) или `pending` (нет файла); файл убирается из
+        `uploaded`/`sent` → `downloaded` (есть файл) или `pending` (нет файла); файл убирается из
         `upload_archive.txt`, чтобы его можно было загрузить снова.
       operationId: apiUnmarkUploaded
       requestBody:
@@ -451,7 +455,8 @@ paths:
       summary: Сверить треки «В ЯМ» из локальной базы с плейлистом Яндекс Музыки
       description: |
         Сопоставление по нормализованным исполнителю и названию (или только названию).
-        Статусы не меняет. Плейлист должен принадлежать текущему аккаунту.
+        Меняет только статусы `sent`: найден → `uploaded`; не найден дольше суток → `downloaded`/`pending`
+        с ошибкой. Плейлист должен принадлежать текущему аккаунту.
       operationId: apiCheckPlaylist
       responses:
         "200":
@@ -589,10 +594,11 @@ components:
         total: { type: integer }
         pending: { type: integer }
         downloaded: { type: integer }
+        sent: { type: integer, description: «Ждёт ЯМ» — принят ЯМ, ещё не найден в плейлисте }
         uploaded: { type: integer }
         not_in_likes: { type: integer }
         unavailable: { type: integer }
-        not_in_ym: { type: integer, description: Все, кроме uploaded }
+        not_in_ym: { type: integer, description: Все, кроме uploaded (в т.ч. sent) }
         with_errors: { type: integer, description: С сохранённой ошибкой, кроме unavailable }
         local_files: { type: integer }
         size_mb: { type: number }
@@ -671,7 +677,7 @@ components:
 
     TrackItem:
       type: object
-      required: [id, title, artist, status, added, error, has_file, sc_url]
+      required: [id, title, artist, status, added, error, has_file, sc_url, sent_at]
       properties:
         id:
           type: string
@@ -683,7 +689,7 @@ components:
           description: Может быть пустым до скачивания — плоский скан лайков не отдаёт исполнителя
         status:
           type: string
-          enum: [pending, downloaded, uploaded, not_in_likes, unavailable]
+          enum: [pending, downloaded, sent, uploaded, not_in_likes, unavailable]
         added:
           type: string
           description: Дата появления в базе, YYYY-MM-DD
@@ -694,6 +700,9 @@ components:
           type: boolean
         sc_url:
           type: string
+        sent_at:
+          type: ["number", "null"]
+          description: Для `sent` — время отправки (unix); иначе null
 
     PlaylistReport:
       type: object
@@ -731,6 +740,13 @@ components:
             properties:
               artist: { type: string }
               title: { type: string }
+        sent_waiting:
+          type: array
+          description: Треки «Ждёт ЯМ» после этой сверки (ещё не найдены, сутки не прошли)
+          items:
+            $ref: "#/components/schemas/TrackItem"
+        confirmed_now: { type: integer, description: Сколько «Ждёт ЯМ» подтверждено этой сверкой }
+        expired_now: { type: integer, description: Сколько «Ждёт ЯМ» возвращено по тайм-ауту }
 
     HistoryRecordBase:
       type: object

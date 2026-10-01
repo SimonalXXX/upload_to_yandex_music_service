@@ -12,6 +12,7 @@
 | [`cli-contract.md`](./cli-contract.md) | Контракт CLI (`sc_downloader.py`, `ym_uploader.py`) |
 | [`templates/feature-spec.md`](./templates/feature-spec.md) | Шаблон спецификации новой возможности |
 | [`features/ui-redesign.md`](./features/ui-redesign.md) | Новый интерфейс: раскладка, синхронизация, плеер, горячие клавиши, критерии приёмки |
+| [`features/upload-confirmation.md`](./features/upload-confirmation.md) | Статус «Ждёт ЯМ»: «В ЯМ» только после появления трека в плейлисте; выделение кликом |
 
 При противоречии приоритет такой: **спецификация API/SSE в `specs/` → код → SDD**, если явно не решено иначе в PR.
 
