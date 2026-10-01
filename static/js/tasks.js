@@ -200,6 +200,7 @@ export function resultText(name, r) {
   }
   if (s.downloaded) parts.push(`скачано: ${s.downloaded}`);
   if (s.uploaded) parts.push(`в ЯМ: ${s.uploaded}`);
+  if (s.sent) parts.push(`отправлено, ждут появления в ЯМ: ${s.sent}`);
   if (s.failures) parts.push(`не скачано: ${s.failures}`);
   if (s.upload_errors) parts.push(`ошибок загрузки: ${s.upload_errors}`);
   if (s.missing) parts.push(`не найдено в плейлисте: ${s.missing}`);

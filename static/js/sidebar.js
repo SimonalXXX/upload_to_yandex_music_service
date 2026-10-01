@@ -4,7 +4,7 @@ import { $, esc, fmtIn, icon } from './dom.js';
 import { FILTERS, filterCounts, on, state } from './store.js';
 
 // Редкие разделы показываем, только когда в них что-то есть (или они открыты).
-const OPTIONAL = new Set(['not_in_likes', 'unavailable', 'errors']);
+const OPTIONAL = new Set(['sent', 'not_in_likes', 'unavailable', 'errors']);
 let frame = 0;
 
 export function init() {

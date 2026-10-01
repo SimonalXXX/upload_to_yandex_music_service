@@ -65,7 +65,10 @@ function describe(ev) {
     case 'track_done': return ['ok', `✓ ${ev.title}`];
     case 'dl_complete': return [ev.failures ? 'warn' : 'ok', `Скачано: ${ev.downloaded}${ev.failures ? `, не удалось: ${ev.failures}` : ''}`];
     case 'upload_start': return ['', `Загрузка в ЯМ: ${ev.total}`];
-    case 'track_uploaded': return ['ok', `↑ ${state.byId.get(ev.id)?.title || ev.id}`];
+    case 'track_uploaded': return ['ok', `↑ ${state.byId.get(ev.id)?.title || ev.id} — в ЯМ`];
+    case 'track_status': return ev.status === 'sent'
+      ? ['', `${state.byId.get(ev.id)?.title || ev.id} — принят, ждёт появления в ЯМ`]
+      : ['error', `${state.byId.get(ev.id)?.title || ev.id}: ${ev.error}`];
     case 'log': return [ev.level || '', ev.message];
     case 'all_done': return [ev.level || 'ok', ev.message || 'Готово'];
     case 'cancelled': return ['warn', 'Остановлено'];

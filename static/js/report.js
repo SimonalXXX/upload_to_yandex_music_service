@@ -4,7 +4,7 @@ import { api } from './api.js';
 import { $, confirmDialog, count, esc, fmtWhen, icon, toast } from './dom.js';
 import { actUnmark, setSelection } from './library.js';
 import { on, emit, state } from './store.js';
-import { runTask } from './tasks.js';
+import { refreshData, runTask } from './tasks.js';
 
 const picked = new Set();
 let checking = false;
@@ -25,6 +25,13 @@ async function check() {
     state.report = await api.checkPlaylist();
     picked.clear();
     emit('report');
+    const { confirmed_now: ok = 0, expired_now: bad = 0 } = state.report;
+    if (ok || bad) {
+      // Сверка подтвердила или вернула «Ждёт ЯМ» — статусы в медиатеке изменились.
+      await refreshData().catch(() => {});
+      toast(`Подтверждено «В ЯМ»: ${ok}` + (bad ? `, не приняты ЯМ за сутки: ${bad}` : ''),
+        { kind: bad ? 'warn' : 'ok' });
+    }
   } catch (err) {
     toast(err.message, { kind: 'error', title: 'Сверка не удалась' });
   } finally {
@@ -85,6 +92,11 @@ function render() {
         <input type="checkbox" data-id="${esc(t.id)}" ${picked.has(t.id) ? 'checked' : ''} aria-label="Выбрать">
         <div class="grow"><div>${esc(t.title)}</div><div class="sub">${esc(t.artist || '—')}${t.has_file ? '' : ' · файла нет — будет скачан заново'}</div></div>
       </li>`).join('')}</ul></div>` : `<div class="group"><ul class="plain-list"><li class="muted">${icon('check')} Все треки «В ЯМ» на месте</li></ul></div>`}
+
+    ${(r.sent_waiting || []).length ? `<h2>Ждут появления в ЯМ · ${r.sent_waiting.length}</h2>
+    <p class="lead">ЯМ принял файлы, но в плейлисте их пока нет. Они станут «В ЯМ», когда появятся; если не появятся за сутки — вернутся в «На диске» с ошибкой.</p>
+    <div class="group"><ul class="plain-list">${r.sent_waiting.map(t => `<li><div class="grow"><div>${esc(t.title)}</div>
+      <div class="sub">${esc(t.artist || '—')}${t.sent_at ? ` · отправлен ${esc(fmtWhen(t.sent_at))}` : ''}</div></div></li>`).join('')}</ul></div>` : ''}
 
     <h2>Дубли в плейлисте · ${r.duplicates_list.length}</h2>
     <p class="lead">Удалить лишние копии можно в самой Яндекс Музыке. Здесь — только список.</p>

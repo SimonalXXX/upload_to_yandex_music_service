@@ -36,9 +36,16 @@ HISTORY_PATH = BASE_DIR / "history.json"
 STATIC_DIR = BASE_DIR / "static"
 PORT = 5555
 
-CSV_FIELDS = ["sc_id", "title", "artist", "sc_url", "status", "file", "added", "error"]
-# pending → downloaded → uploaded; not_in_likes — пропал из лайков; unavailable — скачать нельзя
-STATUSES = ("pending", "downloaded", "uploaded", "not_in_likes", "unavailable")
+CSV_FIELDS = ["sc_id", "title", "artist", "sc_url", "status", "file", "added", "error", "sent_at"]
+# pending → downloaded → sent → uploaded; not_in_likes — пропал из лайков; unavailable — скачать нельзя.
+# sent — ЯМ принял файл, но трек ещё не найден в плейлисте (specs/features/upload-confirmation.md).
+STATUSES = ("pending", "downloaded", "sent", "uploaded", "not_in_likes", "unavailable")
+SENT_TIMEOUT = 24 * 3600       # не появился в плейлисте за сутки → ЯМ не принял трек
+SENT_CHECK_INTERVAL = 15 * 60  # фоновая проверка отправленных
+# Короткое окно подтверждения при загрузке: ЯМ обрабатывает файл минутами, долгое
+# ожидание только блокировало задачу; подтверждаем позже по плейлисту (_confirm_sent).
+UPLOAD_VERIFY_RETRIES = 2
+UPLOAD_VERIFY_DELAY = 3
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac"}
 AUDIO_MIME = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".opus": "audio/ogg", ".flac": "audio/flac"}
 # Незавершённые скачивания yt-dlp (после отмены/сбоя) — подчищаем.
@@ -379,6 +386,7 @@ def _load_tracks() -> dict:
                     "file": _abs_file(row.get("file")),
                     "added": row.get("added") or "",
                     "error": row.get("error") or "",
+                    "sent_at": row.get("sent_at") or "",
                 }
         return result
 
@@ -417,6 +425,7 @@ def _track_view(sc_id: str, info: dict) -> dict:
         "error": info.get("error") or "",
         "has_file": bool(f and Path(f).exists()),
         "sc_url": info.get("sc_url") or "",
+        "sent_at": float(info["sent_at"]) if info.get("sent_at") else None,
     }
 
 
@@ -475,7 +484,7 @@ def _sync_archive() -> None:
         changed = False
         for sc_id, info in tracks.items():
             key = f"soundcloud {sc_id}"
-            if info.get("status") in ("downloaded", "uploaded"):
+            if info.get("status") in ("downloaded", "sent", "uploaded"):
                 existing.add(key)
             elif key in existing and info.get("status") in ("pending", "not_in_likes", "unavailable"):
                 fpath = info.get("file")
@@ -757,7 +766,7 @@ def _do_scan(config: dict) -> dict:
             sc_id = str(e.get("id"))
             prev = tracks.get(sc_id)
             sc_url = e.get("url") or e.get("webpage_url") or (prev or {}).get("sc_url", "")
-            if prev and prev.get("status") in ("downloaded", "uploaded", "unavailable"):
+            if prev and prev.get("status") in ("downloaded", "sent", "uploaded", "unavailable"):
                 known += 1
                 if not prev.get("title"):
                     prev["title"] = e.get("title") or ""
@@ -777,6 +786,7 @@ def _do_scan(config: dict) -> dict:
                 "file": (prev or {}).get("file"),
                 "added": (prev or {}).get("added") or time.strftime("%Y-%m-%d"),
                 "error": (prev or {}).get("error", ""),
+                "sent_at": "",
             }
         not_in_likes_n = 0
         # С лимитом max_tracks список неполный — «пропавшие» за лимитом не пропали.
@@ -929,7 +939,7 @@ def _do_download(config: dict, track_ids: list | None) -> dict:
         nonlocal failures
         failures += 1
         reason = _unavailable_reason(raw)
-        if reason and prev_status != "uploaded":
+        if reason and prev_status not in ("uploaded", "sent"):
             entry = _track_update(sc_id, status="unavailable", error=reason)
             message = f"{title}: {reason}"
         else:
@@ -960,8 +970,8 @@ def _do_download(config: dict, track_ids: list | None) -> dict:
             entry = existing_tracks[sc_id]
             title_hint = (entry.get("title") or sc_id)[:80]
             prev_status = entry.get("status") or "pending"
-            # Перекачка уже отправленного в ЯМ трека не должна сбрасывать «uploaded».
-            new_status = "uploaded" if prev_status == "uploaded" else "downloaded"
+            # Перекачка уже отправленного в ЯМ трека не должна сбрасывать «uploaded»/«sent».
+            new_status = prev_status if prev_status in ("uploaded", "sent") else "downloaded"
             current_id[0] = sc_id
 
             existing_file = entry.get("file")
@@ -1078,10 +1088,11 @@ def _check_auth(refresh: bool = False) -> dict:
 def _do_upload(config: dict, track_ids: list | None = None) -> dict:
     """Загрузка треков в ЯМ; пишет upload_archive.txt как CLI.
 
-    track_ids — именно эти треки (даже уже «uploaded»: выбор пользователя в UI имеет
+    track_ids — именно эти треки (даже уже «uploaded»/«sent»: выбор пользователя в UI имеет
     приоритет, UI предупреждает о дублях). Иначе — все со статусом «downloaded».
-    Возвращает итог; «мягкие» отказы (нет плейлиста, нет авторизации) — через level/message,
-    чтобы итог скачивания в той же задаче не терялся.
+    Подтверждённый по id трек → «uploaded»; принятый, но ещё не найденный в плейлисте →
+    «sent» (подтверждается позже в _confirm_sent). «Мягкие» отказы (нет плейлиста, нет
+    авторизации) — через level/message, чтобы итог скачивания в той же задаче не терялся.
     """
     from ym_uploader import DEFAULT_UPLOAD_ARCHIVE, _record_uploaded, _upload_one, get_playlist_tracks
 
@@ -1113,93 +1124,151 @@ def _do_upload(config: dict, track_ids: list | None = None) -> dict:
         return {"uploaded": 0, "level": "error", "message": str(e)}
     session, uid, token, kind = ctx["session"], ctx["uid"], ctx["token"], ctx["kind"]
 
-    uploaded = 0
+    uploaded = 0      # подтверждены по id → «uploaded»
+    sent_ids: list[str] = []  # приняты, ждут появления в плейлисте → «sent»
     upload_errors = 0
     upload_delay = float(ym.get("upload_delay", 3))
     del_after = bool(ym.get("delete_after_upload", False))
-    accepted: list[str] = []  # приняты сервером, но ещё не подтверждены в плейлисте
 
-    for sc_id, info in to_upload:
-        _check_cancel({"uploaded": uploaded})
+    def _counts() -> dict:
+        return {"uploaded": uploaded, "sent": len(sent_ids)}
+
+    for i, (sc_id, info) in enumerate(to_upload):
+        _check_cancel(_counts())
         filepath = Path(info["file"])
         name = filepath.stem
         _broadcast({
             "type": "uploading",
             "id": sc_id,
             "title": (name[:50] + "…") if len(name) > 50 else name,
-            "uploaded": uploaded,
+            "uploaded": i,
             "total": len(to_upload),
         })
         try:
-            res = _upload_one(session, uid, kind, filepath, token, cancel_event=_cancel)
+            res = _upload_one(session, uid, kind, filepath, token, cancel_event=_cancel,
+                              verify_retries=UPLOAD_VERIFY_RETRIES, verify_delay=UPLOAD_VERIFY_DELAY)
             if res:
-                uploaded += 1
                 _record_uploaded(DEFAULT_UPLOAD_ARCHIVE, filepath)
-                _track_update(sc_id, status="uploaded", error="")
-                if res == "accepted":
-                    accepted.append(sc_id)
-                    _broadcast({"type": "log", "id": sc_id, "level": "warn",
-                                "message": f"{name}: файл принят, ЯМ ещё обрабатывает — "
-                                           "проверю плейлист после загрузки"})
-                # Удаляем только при точном подтверждении по id трека: «grown» (плейлист
-                # вырос — мог вырасти и за счёт прошлого дообработанного трека) и
-                # «accepted» не гарантируют, что доехал именно этот файл.
-                if del_after and res is True:
-                    _delete_file_safe(str(filepath.resolve()))
-                    _track_update(sc_id, file="")
-                _broadcast({"type": "track_uploaded", "id": sc_id})
+                if res is True:
+                    uploaded += 1
+                    _track_update(sc_id, status="uploaded", error="", sent_at="")
+                    # Удаляем только при точном подтверждении по id трека.
+                    if del_after:
+                        _delete_file_safe(str(filepath.resolve()))
+                        _track_update(sc_id, file="")
+                    _broadcast({"type": "track_uploaded", "id": sc_id})
+                else:
+                    # «accepted»/«grown»: ЯМ принял файл, но трек ещё не в плейлисте — обработка
+                    # может молча не удаться, поэтому это не «В ЯМ», а «Ждёт ЯМ».
+                    sent_ids.append(sc_id)
+                    _track_update(sc_id, status="sent", error="", sent_at=str(int(time.time())))
+                    _broadcast({"type": "track_status", "id": sc_id, "status": "sent", "error": ""})
+                    _broadcast({"type": "log", "id": sc_id, "level": "info",
+                                "message": f"{name}: принят, ЯМ обрабатывает — станет «В ЯМ», "
+                                           "когда появится в плейлисте"})
             else:
                 upload_errors += 1
                 _track_update(sc_id, error="Не удалось загрузить в ЯМ")
                 _broadcast({"type": "log", "id": sc_id, "level": "error",
                             "message": f"{name}: не удалось загрузить"})
         except Exception as e:
-            _check_cancel({"uploaded": uploaded})
+            _check_cancel(_counts())
             upload_errors += 1
             _track_update(sc_id, error=f"ЯМ: {e!s:.200}")
             _broadcast({"type": "log", "id": sc_id, "level": "error", "message": f"{name}: {e!s:.100}"})
         if _cancel.wait(upload_delay):
             break  # «Остановить» прерывает и паузу между загрузками
-    _check_cancel({"uploaded": uploaded})
+    _check_cancel(_counts())
 
-    # ── Автопроверка: дожидаемся появления принятых треков в плейлисте ──
-    if accepted:
-        _broadcast({"type": "log", "level": "info",
-                    "message": f"Проверяю плейлист: жду появления {len(accepted)} трек(ов)…"})
-        tracks_db = _load_tracks()
-        pending_ids = set(accepted)
+    # Один запрос без ожидания: треки, отправленные в начале длинной загрузки, могли уже появиться.
+    if sent_ids:
         try:
-            for _ in range(6):  # до ~1 минуты
-                if _cancel.wait(10):
-                    break
-                pl_tracks = get_playlist_tracks(session, uid, kind, token)
-                keys = {(_norm(t["artist"]), _norm(t["title"])) for t in pl_tracks}
-                titles = {_norm(t["title"]) for t in pl_tracks if t["title"]}
-                for sid in list(pending_ids):
-                    info = tracks_db.get(sid, {})
-                    k = (_norm(info.get("artist")), _norm(info.get("title")))
-                    if k in keys or (k[1] and k[1] in titles):
-                        pending_ids.discard(sid)
-                        _broadcast({"type": "log", "id": sid, "level": "info",
-                                    "message": f"{(info.get('title') or sid)[:50]}: "
-                                               "появился в плейлисте ✓"})
-                if not pending_ids:
-                    break
+            _confirm_sent(get_playlist_tracks(session, uid, kind, token))
         except Exception:
-            pass  # сверка — не повод ронять итог загрузки
-        if pending_ids:
-            _broadcast({"type": "log", "level": "warn",
-                        "message": f"Пока не видны в плейлисте: {len(pending_ids)} — "
-                                   "сверьте плейлист через пару минут"})
+            pass  # проверим позже — фоном или при сверке
+    now_tracks = _load_tracks()
+    confirmed_late = sum(1 for sid in sent_ids if now_tracks.get(sid, {}).get("status") == "uploaded")
+    uploaded += confirmed_late
+    sent = len(sent_ids) - confirmed_late
 
-    result = {"uploaded": uploaded, "upload_errors": upload_errors}
+    result = {"uploaded": uploaded, "sent": sent, "upload_errors": upload_errors}
     if upload_errors:
         result["level"] = "warn"
     return result
 
 
+def _pl_matcher(pl_tracks: list[dict]):
+    """Функция «есть ли трек базы в плейлисте» — по исполнителю и названию, как в «Сверке»."""
+    keys = {(_norm(t["artist"]), _norm(t["title"])) for t in pl_tracks}
+    titles = {_norm(t["title"]) for t in pl_tracks if t["title"]}
+
+    def found(info: dict) -> bool:
+        k = (_norm(info.get("artist")), _norm(info.get("title")))
+        return k in keys or bool(k[1] and k[1] in titles)
+    return found
+
+
+def _confirm_sent(pl_tracks: list[dict] | None = None) -> dict:
+    """Проверка треков «Ждёт ЯМ» (sent) по плейлисту.
+
+    Найден → «uploaded». Не найден дольше SENT_TIMEOUT → обратно «downloaded» (есть файл)
+    или «pending» с ошибкой, файл убирается из upload_archive.txt — чтобы его можно было
+    отправить снова. Иначе остаётся «sent». pl_tracks=None — плейлист загружается здесь.
+    """
+    from ym_uploader import DEFAULT_UPLOAD_ARCHIVE, _forget_uploaded, get_playlist_tracks
+    if not any(t.get("status") == "sent" for t in _load_tracks().values()):
+        return {"confirmed": 0, "expired": 0, "waiting": 0}
+    if pl_tracks is None:
+        ctx = _ym_connect((_load_config().get("yandex_music") or {}).get("playlist_url", ""))
+        pl_tracks = get_playlist_tracks(ctx["session"], ctx["uid"], ctx["kind"], ctx["token"])
+    found = _pl_matcher(pl_tracks)
+    now = time.time()
+    events: list[dict] = []
+    forget: set[str] = set()
+    confirmed = expired = waiting = 0
+    with _db_lock:
+        tracks = _load_tracks()
+        for sid, info in tracks.items():
+            if info.get("status") != "sent":
+                continue
+            if found(info):
+                info.update(status="uploaded", sent_at="", error="")
+                confirmed += 1
+                events.append({"type": "track_uploaded", "id": sid})
+                continue
+            sent_at = float(info.get("sent_at") or 0) or now
+            if not info.get("sent_at"):
+                info["sent_at"] = str(int(now))
+            if now - sent_at > SENT_TIMEOUT:
+                fpath = info.get("file")
+                has_file = bool(fpath and Path(fpath).exists())
+                info.update(status="downloaded" if has_file else "pending", sent_at="",
+                            error="ЯМ не принял трек: не появился в плейлисте за сутки")
+                if fpath:
+                    forget.add(Path(fpath).name)
+                expired += 1
+                events.append({"type": "track_status", "id": sid,
+                               "status": info["status"], "error": info["error"]})
+            else:
+                waiting += 1
+        if confirmed or expired or waiting:
+            _save_tracks(tracks)
+    if forget:
+        _forget_uploaded(DEFAULT_UPLOAD_ARCHIVE, forget)
+        _sync_archive()
+    for ev in events:
+        _broadcast(ev)
+    if confirmed or expired:
+        _broadcast({"type": "log", "level": "warn" if expired else "info",
+                    "message": f"Проверка отправленных: подтверждено «В ЯМ» — {confirmed}"
+                               + (f", не приняты ЯМ за сутки — {expired}" if expired else "")
+                               + (f", ещё ждут — {waiting}" if waiting else "")})
+    return {"confirmed": confirmed, "expired": expired, "waiting": waiting}
+
+
 def _playlist_report(config: dict) -> dict:
-    """Сверка треков «в ЯМ» из базы с плейлистом: ненайденные, дубли, в обработке."""
+    """Сверка треков «в ЯМ» из базы с плейлистом: ненайденные, дубли, в обработке.
+    Заодно подтверждает «Ждёт ЯМ» (sent), которые уже появились (_confirm_sent)."""
     global _last_report
     from ym_uploader import get_playlist_info, get_playlist_tracks
     playlist_url = (config.get("yandex_music") or {}).get("playlist_url", "")
@@ -1212,9 +1281,9 @@ def _playlist_report(config: dict) -> dict:
     except Exception as e:
         raise TaskError(f"Ошибка API Яндекс Музыки: {e!s:.200}") from e
 
+    confirm = _confirm_sent(pl_tracks)
+
     pl_keys = [(_norm(t["artist"]), _norm(t["title"])) for t in pl_tracks]
-    key_set = set(pl_keys)
-    titles = {k[1] for k in pl_keys if k[1]}
     first_seen: dict[tuple, dict] = {}
     for key, t in zip(pl_keys, pl_tracks):
         first_seen.setdefault(key, t)
@@ -1225,17 +1294,19 @@ def _playlist_report(config: dict) -> dict:
     processing = [{"artist": t["artist"], "title": t["title"]}
                   for t in pl_tracks if not t["available"]]
 
+    found_in_pl = _pl_matcher(pl_tracks)
     tracks = _load_tracks()
     found = 0
     missing: list[dict] = []
+    waiting: list[dict] = []
     for sid, info in tracks.items():
-        if info.get("status") != "uploaded":
-            continue
-        k = (_norm(info.get("artist")), _norm(info.get("title")))
-        if k in key_set or (k[1] and k[1] in titles):
-            found += 1
-        else:
-            missing.append(_track_view(sid, info))
+        if info.get("status") == "sent":
+            waiting.append(_track_view(sid, info))
+        elif info.get("status") == "uploaded":
+            if found_in_pl(info):
+                found += 1
+            else:
+                missing.append(_track_view(sid, info))
     _last_report = {
         "checked_at": time.time(),
         "playlist": pl_info,
@@ -1247,6 +1318,9 @@ def _playlist_report(config: dict) -> dict:
         "duplicates_list": dups,
         "processing": len(processing),
         "processing_list": processing,
+        "sent_waiting": waiting,
+        "confirmed_now": confirm["confirmed"],
+        "expired_now": confirm["expired"],
     }
     return _last_report
 
@@ -1301,15 +1375,18 @@ def _task_sync(config: dict, opts: dict | None = None) -> dict:
             up = _do_upload(config)
         except TaskCancelled as c:
             raise TaskCancelled({**summary, **c.counts}) from None
-        if up.get("level") == "error" or up.get("uploaded") or up.get("upload_errors"):
+        if up.get("level") == "error" or up.get("uploaded") or up.get("sent") or up.get("upload_errors"):
             summary.update(up)
         _check_cancel(summary)
         if summary.get("level") != "error":
             _broadcast({"type": "sync_step", "step": "verify"})
             try:
-                rep = _playlist_report(config)
+                rep = _playlist_report(config)  # заодно подтверждает «Ждёт ЯМ»
                 summary["missing"] = rep["missing_total"]
                 summary["duplicates"] = rep["duplicates"]
+                summary["sent"] = len(rep["sent_waiting"])
+                if rep["confirmed_now"] and "uploaded" in summary:
+                    summary["uploaded"] += rep["confirmed_now"]
             except TaskError as e:
                 summary.update(level="warn", message=f"Сверка не выполнена: {e}")
 
@@ -1339,9 +1416,18 @@ def _autosync_state(settings: dict | None = None) -> dict:
 
 def _scheduler_loop() -> None:
     """Раз в 30 с: если автосинхронизация включена и подошло время — запускаем sync.
-    Занято другой задачей — попробуем на следующем тике."""
+    Занято другой задачей — попробуем на следующем тике.
+    Раз в SENT_CHECK_INTERVAL, пока есть «Ждёт ЯМ» и нет задачи, — проверка отправленных."""
+    last_sent_check = 0.0
     while True:
         time.sleep(30)
+        try:
+            if (not _active_task and time.time() - last_sent_check >= SENT_CHECK_INTERVAL
+                    and any(t.get("status") == "sent" for t in _load_tracks().values())):
+                last_sent_check = time.time()
+                _confirm_sent()
+        except Exception:
+            pass  # нет авторизации ЯМ и т.п. — попробуем через интервал
         try:
             cfg = _load_config()
             s = _settings(cfg)
@@ -1365,7 +1451,7 @@ def _mark_uploaded(track_ids: list[str] | None = None, *, mark_all_pending: bool
     (sc_downloader.py --upload) не залил их повторно.
     """
     from ym_uploader import DEFAULT_UPLOAD_ARCHIVE, _record_uploaded
-    movable = ("pending", "downloaded", "not_in_likes", "unavailable")
+    movable = ("pending", "downloaded", "sent", "not_in_likes", "unavailable")
     marked_files: list[Path] = []
     with _db_lock:
         tracks = _load_tracks()
@@ -1381,6 +1467,7 @@ def _mark_uploaded(track_ids: list[str] | None = None, *, mark_all_pending: bool
                 continue
             info["status"] = "uploaded"
             info["error"] = ""
+            info["sent_at"] = ""
             count += 1
             fpath = info.get("file")
             if fpath and Path(fpath).exists():
@@ -1393,7 +1480,7 @@ def _mark_uploaded(track_ids: list[str] | None = None, *, mark_all_pending: bool
 
 
 def _unmark_uploaded(track_ids: list[str]) -> int:
-    """Снимает отметку «В ЯМ»: есть файл → downloaded, нет → pending.
+    """Снимает отметку «В ЯМ» (или «Ждёт ЯМ»): есть файл → downloaded, нет → pending.
     Файл убирается из upload_archive.txt, чтобы его можно было загрузить снова."""
     from ym_uploader import DEFAULT_UPLOAD_ARCHIVE, _forget_uploaded
     names: set[str] = set()
@@ -1402,11 +1489,12 @@ def _unmark_uploaded(track_ids: list[str]) -> int:
         tracks = _load_tracks()
         for sid in {str(t) for t in track_ids}:
             info = tracks.get(sid)
-            if not info or info.get("status") != "uploaded":
+            if not info or info.get("status") not in ("uploaded", "sent"):
                 continue
             fpath = info.get("file")
             has_file = bool(fpath and Path(fpath).exists())
             info["status"] = "downloaded" if has_file else "pending"
+            info["sent_at"] = ""
             if fpath:
                 names.add(Path(fpath).name)
             count += 1

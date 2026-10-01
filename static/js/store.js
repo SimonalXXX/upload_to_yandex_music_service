@@ -53,6 +53,7 @@ export const FILTERS = [
   { id: 'all', label: 'Все треки', icon: 'music', test: () => true },
   { id: 'pending', label: 'Новые', icon: 'sparkle', test: t => t.status === 'pending' },
   { id: 'downloaded', label: 'На диске', icon: 'disk', test: t => t.status === 'downloaded' },
+  { id: 'sent', label: 'Ждут ЯМ', icon: 'clock', test: t => t.status === 'sent' },
   { id: 'uploaded', label: 'В Яндекс Музыке', icon: 'ym', test: t => t.status === 'uploaded' },
   { id: 'not_in_ym', label: 'Не в ЯМ', icon: 'notym', test: t => t.status !== 'uploaded' },
   { id: 'not_in_likes', label: 'Пропали из лайков', icon: 'heartoff', test: t => t.status === 'not_in_likes' },
@@ -64,6 +65,7 @@ export const filterById = id => FILTERS.find(f => f.id === id) || FILTERS[0];
 export const STATUS_LABEL = {
   pending: 'Новый',
   downloaded: 'На диске',
+  sent: 'Ждёт ЯМ',
   uploaded: 'В ЯМ',
   not_in_likes: 'Пропал из лайков',
   unavailable: 'Недоступен',

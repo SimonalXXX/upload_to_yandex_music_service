@@ -304,6 +304,8 @@ mark { background: rgba(255, 204, 0, .35); color: inherit; border-radius: 2px; }
 .st-pending { background: color-mix(in srgb, var(--blue) 14%, transparent); color: var(--blue); }
 .st-downloaded { background: color-mix(in srgb, var(--indigo) 14%, transparent); color: var(--indigo); }
 .st-uploaded { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
+/* «Ждёт ЯМ»: принят ЯМ, но ещё не найден в плейлисте — «почти В ЯМ», поэтому пунктир. */
+.st-sent { background: transparent; color: var(--green); border: 1px dashed color-mix(in srgb, var(--green) 70%, transparent); }
 .st-not_in_likes { background: var(--fill-2); color: var(--label-2); }
 .st-unavailable { background: color-mix(in srgb, var(--orange) 15%, transparent); color: var(--orange); }
 .st-live { background: color-mix(in srgb, var(--accent) 13%, transparent); color: var(--accent); }

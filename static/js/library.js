@@ -5,7 +5,7 @@ import {
   $, artStyle, confirmDialog, count, esc, fmtAdded, highlight, hydrateIcons, icon, openMenu, toast,
 } from './dom.js';
 import {
-  LIVE_LABEL, STATUS_LABEL, busy, emit, filterById, on, scAuthor, state, visibleTracks,
+  LIVE_LABEL, STATUS_LABEL, TASK_TITLES, busy, emit, filterById, on, scAuthor, state, visibleTracks,
 } from './store.js';
 import * as player from './player.js';
 import { refreshData, runTask } from './tasks.js';
@@ -24,10 +24,14 @@ export function init() {
 
   list.addEventListener('scroll', schedule, { passive: true });
   new ResizeObserver(schedule).observe(list);
-  list.addEventListener('click', onListClick);
-  list.addEventListener('dblclick', onListDblClick);
+  // Выбор — на нажатие кнопки мыши (как в Finder), а не на click: строки часто перерисовываются
+  // (прогресс, фокус), и если строку заменить между mousedown и mouseup, click не наступит.
+  list.addEventListener('mousedown', onListPointer);
+  // Галочку ведём сами (по состоянию выбора) — нативное переключение отключаем.
+  list.addEventListener('click', e => { if (e.target.closest('label.chk')) e.preventDefault(); });
   list.addEventListener('contextmenu', onContextMenu);
-  list.addEventListener('focus', () => { if (!state.cursor) moveCursor(0); });
+  // Курсор на первую строку — только при фокусе с клавиатуры (Tab), не при клике мышью.
+  list.addEventListener('focus', () => { if (!state.cursor && list.matches(':focus-visible')) moveCursor(0); });
   chkAll.addEventListener('change', () => toggleAllVisible(chkAll.checked));
   $('#btn-pick').addEventListener('click', e => openPickMenu(e.currentTarget));
   selbar.addEventListener('click', onSelbarClick);
@@ -149,25 +153,29 @@ function renderSelbar() {
   const by = s => sel.filter(t => t.status === s).length;
   const withFile = sel.filter(t => t.has_file).length;
   const inYm = by('uploaded');
+  const sentN = by('sent');
   const parts = [
     by('pending') && `новых ${by('pending')}`,
     by('downloaded') && `на диске ${by('downloaded')}`,
+    sentN && `ждут ЯМ ${sentN}`,
     inYm && `в ЯМ ${inYm}`,
     by('unavailable') && `недоступных ${by('unavailable')}`,
     by('not_in_likes') && `пропали из лайков ${by('not_in_likes')}`,
   ].filter(Boolean);
   const hidden = sel.length - sel.filter(t => filterById(state.filter).test(t)).length;
-  $('#selbar-text').innerHTML = `<b>Выбрано ${sel.length}</b>${parts.length ? ` · ${parts.join(', ')}` : ''}` +
-    (hidden ? `<span class="warn">${hidden} не видно в этом разделе</span>` : '') +
-    (inYm ? `<span class="warn">${inYm === 1 ? 'Трек уже' : `${inYm} уже`} в ЯМ — повторная отправка создаст дубль</span>` : '');
-  const b = act => selbar.querySelector(`[data-act="${act}"]`);
   const running = busy();
-  b('download').disabled = running;
-  b('download-upload').disabled = running;
-  b('upload').disabled = running || !withFile;
-  b('upload').title = withFile ? '' : 'У выбранных треков нет файлов — сначала скачайте';
-  b('mark').disabled = running || sel.length === inYm;
-  b('unmark').disabled = running || !inYm;
+  const why = running ? `Идёт «${TASK_TITLES[state.task.name] || 'задача'}» — действия станут доступны после неё` : '';
+  $('#selbar-text').innerHTML = `<b>Выбрано ${sel.length}</b>${parts.length ? ` · ${parts.join(', ')}` : ''}` +
+    (why ? `<span class="warn">${esc(why)}</span>` : '') +
+    (hidden ? `<span class="warn">${hidden} не видно в этом разделе</span>` : '') +
+    (inYm + sentN ? `<span class="warn">${inYm + sentN === 1 ? 'Трек уже' : `${inYm + sentN} уже`} отправлен${inYm + sentN === 1 ? '' : 'ы'} в ЯМ — повторная отправка создаст дубль</span>` : '');
+  const b = act => selbar.querySelector(`[data-act="${act}"]`);
+  const set = (act, disabled, title = '') => { b(act).disabled = disabled; b(act).title = disabled && why ? why : title; };
+  set('download', running);
+  set('download-upload', running);
+  set('upload', running || !withFile, withFile ? '' : 'У выбранных треков нет файлов — сначала скачайте');
+  set('mark', running || sel.length === inYm);
+  set('unmark', running || !(inYm + sentN));
 }
 
 // ── Выбор ──
@@ -249,28 +257,34 @@ function rowFromEvent(e) {
   return el ? state.byId.get(el.dataset.id) : null;
 }
 
-function onListClick(e) {
+function onListPointer(e) {
+  if (e.button !== 0) return;  // правая кнопка — onContextMenu
   const t = rowFromEvent(e);
   if (!t) return;
   const act = e.target.closest('[data-act]')?.dataset.act;
-  if (act === 'play') { e.stopPropagation(); player.toggleTrack(t.id); return; }
-  if (act === 'more') { e.stopPropagation(); state.cursor = t.id; openTrackMenu(t, e.target.closest('button')); schedule(); return; }
-  if (e.target.matches('input[type=checkbox]')) {
-    if (e.shiftKey) { e.preventDefault(); selectRange(t.id); } else toggle(t.id, e.target.checked);
+  if (act === 'play') { e.preventDefault(); player.toggleTrack(t.id); return; }
+  if (act === 'more') {
+    e.preventDefault();
     state.cursor = t.id;
+    openTrackMenu(t, e.target.closest('button'));
+    schedule();
     return;
   }
-  if (e.target.closest('label.chk')) return;
+  e.preventDefault();  // без выделения текста при Shift-клике; фокус ставим сами
   state.cursor = t.id;
-  if (e.shiftKey) selectRange(t.id);
-  else if (e.metaKey || e.ctrlKey) toggle(t.id);
-  else { state.anchor = t.id; schedule(); }
+  if (e.target.closest('label.chk')) {
+    if (e.shiftKey) selectRange(t.id); else toggle(t.id);
+  } else if (e.detail === 2 && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+    if (t.has_file) player.play(t.id);  // двойной клик — слушать
+  } else if (e.shiftKey) {
+    selectRange(t.id);
+  } else if (e.metaKey || e.ctrlKey) {
+    toggle(t.id);
+  } else {
+    state.anchor = t.id;
+    setSelection([t.id]);  // как в Finder: клик выделяет только эту строку
+  }
   focusList();
-}
-
-function onListDblClick(e) {
-  const t = rowFromEvent(e);
-  if (t && t.has_file && !e.target.closest('[data-act], label.chk')) player.play(t.id);
 }
 
 function onContextMenu(e) {
@@ -298,8 +312,8 @@ export function openTrackMenu(t, at) {
     'sep',
     { label: t.has_file ? 'Скачано' : 'Скачать', icon: 'download', disabled: running || t.has_file, run: () => runTask('download', [t.id], false) },
     { label: 'Скачать и загрузить в ЯМ', icon: 'upload', disabled: running, run: () => actDownloadUpload([t]) },
-    t.status === 'uploaded'
-      ? { label: 'Снять отметку «В ЯМ»', icon: 'undo', disabled: running, run: () => actUnmark([t]) }
+    t.status === 'uploaded' || t.status === 'sent'
+      ? { label: t.status === 'sent' ? 'Снять «Ждёт ЯМ»' : 'Снять отметку «В ЯМ»', icon: 'undo', disabled: running, run: () => actUnmark([t]) }
       : { label: 'Уже в Яндекс Музыке', icon: 'check', disabled: running, run: () => actMark([t]) },
   ], at);
 }
@@ -336,11 +350,11 @@ function onSelbarClick(e) {
 }
 
 async function confirmDuplicates(tracks) {
-  const inYm = tracks.filter(t => t.status === 'uploaded').length;
+  const inYm = tracks.filter(t => t.status === 'uploaded' || t.status === 'sent').length;
   if (!inYm) return true;
   return confirmDialog({
     title: 'Отправить повторно?',
-    text: `${count(inYm, 'трек уже отмечен', 'трека уже отмечены', 'треков уже отмечены')} «В ЯМ». Повторная отправка создаст дубли в плейлисте.`,
+    text: `${count(inYm, 'трек уже отправлен', 'трека уже отправлены', 'треков уже отправлены')} в ЯМ («В ЯМ» или «Ждёт ЯМ»). Повторная отправка создаст дубли в плейлисте.`,
     ok: 'Отправить', iconName: 'alert',
   });
 }
@@ -371,7 +385,7 @@ export async function actMark(tracks) {
 }
 
 export async function actUnmark(tracks) {
-  const ids = tracks.filter(t => t.status === 'uploaded').map(t => t.id);
+  const ids = tracks.filter(t => t.status === 'uploaded' || t.status === 'sent').map(t => t.id);
   if (!ids.length) return;
   if (!await confirmDialog({
     title: `Снять отметку «В ЯМ» с ${count(ids.length, 'трека', 'треков', 'треков')}?`,

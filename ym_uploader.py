@@ -557,6 +557,8 @@ def _upload_one(
     token: str,
     retries: int = 3,
     cancel_event=None,
+    verify_retries: int = 10,
+    verify_delay: float = 5,
 ):
     """Запрашивает upload-target, заливает файл и подтверждает результат по плейлисту.
 
@@ -575,6 +577,9 @@ def _upload_one(
     cancel_event (опционально, threading.Event) — retries и ожидание внутри
     _verify_uploaded прерываются по нему, чтобы кнопка «Остановить» в вебе не
     зависала на несколько минут посреди повторных попыток одного трека.
+
+    verify_retries × verify_delay — окно ожидания подтверждения. ЯМ обрабатывает
+    файл минутами, поэтому веб берёт короткое окно и подтверждает позже по плейлисту.
     """
     last_error: Exception | None = None
     for attempt in range(retries):
@@ -596,6 +601,7 @@ def _upload_one(
         else:
             verified = _verify_uploaded(
                 session, uid, kind, ugc_id, token,
+                retries=verify_retries, delay=verify_delay,
                 cancel_event=cancel_event, count_before=count_before,
             )
             if verified == "id":
