@@ -1,10 +1,8 @@
 // Боковая панель: разделы медиатеки со счётчиками, сверка, история, настройки; статус ЯМ и автосинхронизации.
 
 import { $, esc, fmtIn, icon } from './dom.js';
-import { FILTERS, filterCounts, on, state } from './store.js';
+import { FILTER_GROUPS, filterCounts, on, state } from './store.js';
 
-// Редкие разделы показываем, только когда в них что-то есть (или они открыты).
-const OPTIONAL = new Set(['sent', 'not_in_likes', 'unavailable', 'errors']);
 let frame = 0;
 
 export function init() {
@@ -43,16 +41,19 @@ function item(route, iconName, label, countHtml = '', active = false) {
 function render() {
   const counts = filterCounts();
   const lib = state.view === 'library';
-  let html = '<div class="nav-section">Медиатека</div>';
-  for (const f of FILTERS) {
-    const active = lib && state.filter === f.id;
-    if (OPTIONAL.has(f.id) && !counts[f.id] && !active) continue;
-    const alert = (f.id === 'unavailable' || f.id === 'errors') && counts[f.id];
-    html += item(`library/${f.id}`, f.icon, f.label, `<span class="count${alert ? ' alert' : ''}">${counts[f.id]}</span>`, active);
+  let html = '';
+  // Разделы по признакам (диск / Яндекс Музыка / SoundCloud); пустые необязательные — скрыты.
+  for (const g of FILTER_GROUPS) {
+    let items = '';
+    for (const f of g.items) {
+      const active = lib && state.filter === f.id;
+      if (!f.always && !counts[f.id] && !active) continue;
+      const alert = f.alert && counts[f.id];
+      items += item(`library/${f.id}`, f.icon, f.label, `<span class="count${alert ? ' alert' : ''}">${counts[f.id]}</span>`, active);
+    }
+    if (g.title === 'Яндекс Музыка') items += item('report', 'report', 'Сверка', '', state.view === 'report');
+    if (items) html += (g.title ? `<div class="nav-section">${esc(g.title)}</div>` : '<div class="nav-gap"></div>') + items;
   }
-  html += '<div class="nav-section">Яндекс Музыка</div>';
-  const missing = state.report?.missing_total;
-  html += item('report', 'report', 'Сверка', missing ? `<span class="count alert">${missing}</span>` : '', state.view === 'report');
   html += '<div class="nav-section">Приложение</div>';
   html += item('history', 'clock', 'История', '', state.view === 'history');
   html += item('settings', 'gear', 'Настройки', state.settingsDirty ? '<span class="dirty" title="Есть несохранённые изменения"></span>' : '', state.view === 'settings');

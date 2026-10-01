@@ -114,6 +114,7 @@ button, input, select { font: inherit; color: inherit; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14px; padding: 2px 8px 12px; }
 .brand-icon .icon { width: 20px; height: 20px; color: var(--accent); }
 .nav-section { font-size: 11px; font-weight: 600; color: var(--label-2); padding: 12px 8px 4px; }
+.nav-gap { height: 10px; }
 .nav-item {
   display: flex; align-items: center; gap: 8px; width: 100%;
   padding: 5px 8px; border: 0; background: none; border-radius: var(--radius-s);
@@ -160,7 +161,7 @@ button, input, select { font: inherit; color: inherit; }
   height: 28px; padding: 0 12px; border-radius: var(--radius-s);
   border: 0.5px solid var(--sep); background: var(--bg-elev);
   box-shadow: 0 0.5px 1px rgba(0,0,0,.08);
-  font-weight: 500; white-space: nowrap; cursor: default;
+  font-weight: 500; white-space: nowrap; cursor: default; text-decoration: none;
 }
 .btn .icon { width: 14px; height: 14px; }
 .btn:hover:not(:disabled) { background: var(--bg-2); }
@@ -238,7 +239,7 @@ input[type=checkbox] { width: 15px; height: 15px; margin: 0; accent-color: var(-
 /* ── Track list ─────────────────────────────────────────────────────── */
 .list-head, .row {
   display: grid;
-  grid-template-columns: 32px 40px minmax(0, 1fr) 92px 168px 76px;
+  grid-template-columns: 32px 40px minmax(0, 1fr) 92px 260px 76px;
   align-items: center; column-gap: 10px;
 }
 .list-head {
@@ -291,7 +292,7 @@ input[type=checkbox] { width: 15px; height: 15px; margin: 0; accent-color: var(-
 .meta .artist.guess { color: var(--label-3); }
 mark { background: rgba(255, 204, 0, .35); color: inherit; border-radius: 2px; }
 .added { color: var(--label-2); font-size: 12px; }
-.status-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.status-cell { display: flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; }
 .row-actions { display: flex; justify-content: flex-end; gap: 2px; opacity: 0; }
 .row:hover .row-actions, .row.cursor .row-actions { opacity: 1; }
 
@@ -301,13 +302,17 @@ mark { background: rgba(255, 204, 0, .35); color: inherit; border-radius: 2px; }
   max-width: 100%; overflow: hidden; text-overflow: ellipsis;
 }
 .badge .icon { width: 12px; height: 12px; }
-.st-pending { background: color-mix(in srgb, var(--blue) 14%, transparent); color: var(--blue); }
-.st-downloaded { background: color-mix(in srgb, var(--indigo) 14%, transparent); color: var(--indigo); }
-.st-uploaded { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
-/* «Ждёт ЯМ»: принят ЯМ, но ещё не найден в плейлисте — «почти В ЯМ», поэтому пунктир. */
-.st-sent { background: transparent; color: var(--green); border: 1px dashed color-mix(in srgb, var(--green) 70%, transparent); }
-.st-not_in_likes { background: var(--fill-2); color: var(--label-2); }
-.st-unavailable { background: color-mix(in srgb, var(--orange) 15%, transparent); color: var(--orange); }
+/* Бейджи состояния (specs/features/track-states.md): Яндекс Музыка · диск · SoundCloud. */
+.b-ym-ok { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
+.b-ym-sent { color: var(--green); border: 1px dashed color-mix(in srgb, var(--green) 70%, transparent); }
+.b-ym-manual { background: var(--fill-2); color: var(--label-2); }
+.b-ym-missing { background: color-mix(in srgb, var(--orange) 16%, transparent); color: var(--orange); }
+.b-ym-rejected { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); }
+.b-ym-none { color: var(--label-2); border: 1px solid var(--fill-3); }
+.b-new { background: color-mix(in srgb, var(--blue) 14%, transparent); color: var(--blue); }
+.b-disk { background: color-mix(in srgb, var(--indigo) 14%, transparent); color: var(--indigo); }
+.b-unavail { background: color-mix(in srgb, var(--orange) 15%, transparent); color: var(--orange); }
+.b-unliked { color: var(--label-3); font-weight: 500; padding: 0 2px; }
 .st-live { background: color-mix(in srgb, var(--accent) 13%, transparent); color: var(--accent); }
 .err-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex: none; }
 .mini-spin {
@@ -487,7 +492,7 @@ dialog.alert p { font-size: 12px; margin: 0 0 16px; color: var(--label); white-s
   .btn .lbl { display: none; }
   .search input[type=search] { width: 130px; }
   #sort { display: none; }
-  .list-head, .row { grid-template-columns: 28px 40px minmax(0, 1fr) 118px 30px; }
+  .list-head, .row { grid-template-columns: 28px 40px minmax(0, 1fr) 150px 30px; }
   .list-head .added, .row .added { display: none; }
   .row-actions button:not([data-act=more]) { display: none; }
   .activity-text { display: none; }

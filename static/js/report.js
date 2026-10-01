@@ -1,12 +1,27 @@
-// Сверка с плейлистом ЯМ: итоги, «нет в плейлисте» (загрузить заново / снять отметку), дубли, в обработке.
+// Сверка с плейлистом ЯМ: результат записывается в состояние «Яндекс Музыка» каждого трека.
+// Здесь — итоги и списки с действиями: «⚠ нет в плейлисте», «не приняты ЯМ», «ждут появления»,
+// а также дубли и треки в обработке (specs/features/track-states.md).
 
 import { api } from './api.js';
 import { $, confirmDialog, count, esc, fmtWhen, icon, toast } from './dom.js';
-import { actUnmark, setSelection } from './library.js';
+import { actMark, actUnmark, setSelection } from './library.js';
 import { on, emit, state } from './store.js';
 import { refreshData, runTask } from './tasks.js';
 
-const picked = new Set();
+// Выбор — отдельно для каждого списка с действиями.
+const LISTS = {
+  missing: {
+    title: 'Нет в плейлисте',
+    lead: 'Считались «В ЯМ», но при сверке не найдены по исполнителю и названию. Бывает, что ЯМ показывает трек под другим названием — тогда нажмите «Считать «В ЯМ»», и сверка перестанет его помечать.',
+    filter: 'missing',
+  },
+  rejected: {
+    title: 'Не приняты ЯМ',
+    lead: 'ЯМ принял файл, но трек так и не появился в плейлисте за сутки. Можно отправить ещё раз.',
+    filter: 'rejected',
+  },
+};
+const picked = { missing: new Set(), rejected: new Set() };
 let checking = false;
 let root;
 
@@ -14,7 +29,7 @@ export function init() {
   root = $('#view-report');
   root.addEventListener('click', onClick);
   root.addEventListener('change', onChange);
-  for (const t of ['report', 'view', 'task', 'settings', 'tracks']) on(t, render);
+  for (const t of ['report', 'view', 'task', 'settings', 'tracks', 'track']) on(t, render);
 }
 
 async function check() {
@@ -23,21 +38,51 @@ async function check() {
   render();
   try {
     state.report = await api.checkPlaylist();
-    picked.clear();
     emit('report');
-    const { confirmed_now: ok = 0, expired_now: bad = 0 } = state.report;
-    if (ok || bad) {
-      // Сверка подтвердила или вернула «Ждёт ЯМ» — статусы в медиатеке изменились.
-      await refreshData().catch(() => {});
-      toast(`Подтверждено «В ЯМ»: ${ok}` + (bad ? `, не приняты ЯМ за сутки: ${bad}` : ''),
-        { kind: bad ? 'warn' : 'ok' });
-    }
+    await refreshData().catch(() => {});  // сверка записала состояние ЯМ в треки
+    const c = state.report.changes || {};
+    const parts = [
+      c.confirmed && `подтверждено «В ЯМ»: ${c.confirmed}`,
+      c.missing && `нет в плейлисте: ${c.missing}`,
+      c.rejected && `не приняты ЯМ: ${c.rejected}`,
+    ].filter(Boolean);
+    toast(parts.length ? `Изменения: ${parts.join(', ')}` : 'Изменений нет — всё как при прошлой проверке',
+      { kind: c.missing || c.rejected ? 'warn' : 'ok', title: 'Сверка' });
   } catch (err) {
     toast(err.message, { kind: 'error', title: 'Сверка не удалась' });
   } finally {
     checking = false;
     render();
   }
+}
+
+const byYm = ym => state.tracks.filter(t => t.ym === ym);
+
+function listHtml(key, running) {
+  const L = LISTS[key];
+  const tracks = byYm(key);
+  const sel = picked[key];
+  for (const id of [...sel]) if (!tracks.some(t => t.id === id)) sel.delete(id);
+  if (!tracks.length) return '';
+  return `<h2>${esc(L.title)} · ${tracks.length}</h2>
+    <p class="lead">${esc(L.lead)}</p>
+    <div class="group" data-list="${key}">
+      <div class="group-tools">
+        <label><input type="checkbox" data-all="${key}" ${sel.size && sel.size === tracks.length ? 'checked' : ''}> Выбрать все</label>
+        <span class="grow muted">${sel.size ? `выбрано ${sel.size}` : ''}</span>
+        <button class="btn" data-act="show" data-list="${key}" type="button" ${sel.size ? '' : 'disabled'}>В медиатеке</button>
+        <button class="btn" data-act="pin" data-list="${key}" type="button" ${sel.size && !running ? '' : 'disabled'}
+          title="ЯМ переименовал трек, и сверка его не узнаёт — считать его «В ЯМ»">Считать «В ЯМ»</button>
+        <button class="btn" data-act="unmark" data-list="${key}" type="button" ${sel.size && !running ? '' : 'disabled'}
+          title="Трек станет «не отправлен»">Снять «В ЯМ»</button>
+        <button class="btn primary" data-act="reupload" data-list="${key}" type="button" ${sel.size && !running ? '' : 'disabled'}>${icon('upload')}Отправить заново</button>
+      </div>
+      <ul class="plain-list">${tracks.map(t => `<li>
+        <input type="checkbox" data-pick="${key}" data-id="${esc(t.id)}" ${sel.has(t.id) ? 'checked' : ''} aria-label="Выбрать">
+        <div class="grow"><div>${esc(t.title)}</div><div class="sub">${esc(t.artist || '—')}
+          · ${t.has_file ? 'на диске' : 'файла нет — скачается заново'}${t.liked === false ? ' · не в лайках' : ''}</div></div>
+      </li>`).join('')}</ul>
+    </div>`;
 }
 
 function render() {
@@ -54,13 +99,15 @@ function render() {
     ${checking ? '<span class="mini-spin"></span>Сверяю…' : `${icon('sync')}Сверить сейчас`}</button>`;
   if (!r) {
     root.innerHTML = `<div class="page"><div class="empty" style="position:static">${icon('report')}
-      <h3>Сверка ещё не проводилась</h3><p>Сравним треки, отмеченные «В ЯМ», с тем, что реально лежит в плейлисте.</p>${btn}</div></div>`;
+      <h3>Сверка ещё не проводилась</h3><p>Сравним треки, отмеченные «В ЯМ», с тем, что реально лежит в плейлисте, и отметим результат у каждого трека.</p>${btn}</div></div>`;
     return;
   }
   $('#view-subtitle').textContent = `сверено ${fmtWhen(r.checked_at)}`;
-  const missing = r.missing.filter(t => state.byId.has(t.id)).map(t => state.byId.get(t.id));
-  for (const id of [...picked]) if (!missing.some(t => t.id === id)) picked.delete(id);
   const running = !!state.task;
+  const inYm = state.tracks.filter(t => t.ym === 'confirmed' || t.ym === 'pinned').length;
+  const missingN = byYm('missing').length;
+  const sent = byYm('sent');
+  const manual = byYm('manual').length;
 
   root.innerHTML = `<div class="page">
     <div class="report-head">
@@ -72,30 +119,19 @@ function render() {
     </div>
     <div class="stats">
       ${stat(r.playlist_total, 'в плейлисте')}
-      ${stat(r.found, 'найдено')}
-      ${stat(r.missing_total, 'нет в плейлисте', r.missing_total)}
+      ${stat(inYm, 'у нас «В ЯМ»')}
+      ${stat(missingN, 'нет в плейлисте', missingN)}
       ${stat(r.duplicates, 'дублей', r.duplicates)}
       ${stat(r.processing, 'в обработке')}
     </div>
+    ${manual ? `<p class="lead">${icon('info')} ${count(manual, 'трек отмечен', 'трека отмечены', 'треков отмечены')} «Уже в ЯМ» вручную и ещё не проверены — нажмите «Сверить сейчас».</p>` : ''}
 
-    <h2>Нет в плейлисте · ${missing.length}</h2>
-    <p class="lead">Отмечены «В ЯМ», но в плейлисте не найдены по исполнителю и названию. Бывает, что ЯМ показывает трек под другим названием — проверьте перед повторной загрузкой.</p>
-    ${missing.length ? `<div class="group">
-      <div class="group-tools">
-        <label><input type="checkbox" data-act="all" ${picked.size && picked.size === missing.length ? 'checked' : ''}> Выбрать все</label>
-        <span class="grow muted">${picked.size ? `выбрано ${picked.size}` : ''}</span>
-        <button class="btn" data-act="show" type="button" ${picked.size ? '' : 'disabled'}>Показать в медиатеке</button>
-        <button class="btn" data-act="unmark" type="button" ${picked.size && !running ? '' : 'disabled'}>Снять «В ЯМ»</button>
-        <button class="btn primary" data-act="reupload" type="button" ${picked.size && !running ? '' : 'disabled'}>${icon('upload')}Загрузить заново</button>
-      </div>
-      <ul class="plain-list">${missing.map(t => `<li>
-        <input type="checkbox" data-id="${esc(t.id)}" ${picked.has(t.id) ? 'checked' : ''} aria-label="Выбрать">
-        <div class="grow"><div>${esc(t.title)}</div><div class="sub">${esc(t.artist || '—')}${t.has_file ? '' : ' · файла нет — будет скачан заново'}</div></div>
-      </li>`).join('')}</ul></div>` : `<div class="group"><ul class="plain-list"><li class="muted">${icon('check')} Все треки «В ЯМ» на месте</li></ul></div>`}
+    ${listHtml('missing', running) || `<h2>Нет в плейлисте · 0</h2><div class="group"><ul class="plain-list"><li class="muted">${icon('check')} Все треки «В ЯМ» на месте</li></ul></div>`}
+    ${listHtml('rejected', running)}
 
-    ${(r.sent_waiting || []).length ? `<h2>Ждут появления в ЯМ · ${r.sent_waiting.length}</h2>
-    <p class="lead">ЯМ принял файлы, но в плейлисте их пока нет. Они станут «В ЯМ», когда появятся; если не появятся за сутки — вернутся в «На диске» с ошибкой.</p>
-    <div class="group"><ul class="plain-list">${r.sent_waiting.map(t => `<li><div class="grow"><div>${esc(t.title)}</div>
+    ${sent.length ? `<h2>Ждут появления в ЯМ · ${sent.length}</h2>
+    <p class="lead">ЯМ принял файлы, но в плейлисте их пока нет. Станут «В ЯМ», когда появятся; если не появятся за сутки — «Не приняты ЯМ».</p>
+    <div class="group"><ul class="plain-list">${sent.map(t => `<li><div class="grow"><div>${esc(t.title)}</div>
       <div class="sub">${esc(t.artist || '—')}${t.sent_at ? ` · отправлен ${esc(fmtWhen(t.sent_at))}` : ''}</div></div></li>`).join('')}</ul></div>` : ''}
 
     <h2>Дубли в плейлисте · ${r.duplicates_list.length}</h2>
@@ -117,30 +153,34 @@ function stat(n, label, bad = 0) {
 
 function onChange(e) {
   const cb = e.target;
-  if (cb.dataset.act === 'all') {
-    const ids = (state.report?.missing || []).map(t => t.id).filter(id => state.byId.has(id));
-    picked.clear();
-    if (cb.checked) ids.forEach(id => picked.add(id));
-  } else if (cb.dataset.id) {
-    cb.checked ? picked.add(cb.dataset.id) : picked.delete(cb.dataset.id);
+  if (cb.dataset.all) {
+    const key = cb.dataset.all;
+    picked[key].clear();
+    if (cb.checked) byYm(key).forEach(t => picked[key].add(t.id));
+  } else if (cb.dataset.pick) {
+    const set = picked[cb.dataset.pick];
+    cb.checked ? set.add(cb.dataset.id) : set.delete(cb.dataset.id);
   }
   render();
 }
 
 async function onClick(e) {
-  const act = e.target.closest('button[data-act]')?.dataset.act;
-  if (!act) return;
-  const tracks = [...picked].map(id => state.byId.get(id)).filter(Boolean);
+  const b = e.target.closest('button[data-act]');
+  if (!b) return;
+  const act = b.dataset.act;
+  const key = b.dataset.list;
+  const tracks = key ? [...picked[key]].map(id => state.byId.get(id)).filter(Boolean) : [];
   if (act === 'check') check();
   else if (act === 'settings') location.hash = '#settings';
-  else if (act === 'show') { setSelection(tracks.map(t => t.id)); location.hash = '#library/uploaded'; }
-  else if (act === 'unmark') { await actUnmark(tracks); picked.clear(); render(); }
+  else if (act === 'show') { setSelection(tracks.map(t => t.id)); location.hash = `#library/${LISTS[key].filter}`; }
+  else if (act === 'pin') { await actMark(tracks); picked[key].clear(); render(); }
+  else if (act === 'unmark') { await actUnmark(tracks); picked[key].clear(); render(); }
   else if (act === 'reupload') {
     const ok = await confirmDialog({
-      title: `Загрузить заново ${count(tracks.length, 'трек', 'трека', 'треков')}?`,
-      text: 'Треки без файла сначала скачаются. Если трек на самом деле есть в плейлисте под другим названием, появится дубль.',
-      ok: 'Загрузить', iconName: 'upload',
+      title: `Отправить заново ${count(tracks.length, 'трек', 'трека', 'треков')}?`,
+      text: 'Треки без файла сначала скачаются. Если трек на самом деле есть в плейлисте под другим названием, появится дубль — в этом случае лучше «Считать «В ЯМ»».',
+      ok: 'Отправить', iconName: 'upload',
     });
-    if (ok && await runTask('download', tracks.map(t => t.id), true)) picked.clear();
+    if (ok && await runTask('download', tracks.map(t => t.id), true)) picked[key].clear();
   }
 }

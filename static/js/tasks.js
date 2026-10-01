@@ -89,7 +89,7 @@ export function handleEvent(ev) {
       if (t) { t.detail = `Получено ${ev.found}`; renderActivity(); }
       break;
     case 'scan_complete':
-      log(`Лайков: ${ev.total}, новых: ${ev.new_count}` + (ev.not_in_likes ? `, пропали из лайков: ${ev.not_in_likes}` : ''), 'ok');
+      log(`Лайков: ${ev.total}, новых: ${ev.new_count}` + (ev.unliked ? `, пропали из лайков: ${ev.unliked}` : ''), 'ok');
       api.tracks().then(r => setTracks(r.tracks)).catch(() => {});
       if (t?.name === 'scan') state.lastResult = { status: 'ok', summary: ev };
       break;
@@ -109,13 +109,18 @@ export function handleEvent(ev) {
       break;
     case 'track_done':
       state.live.delete(ev.id);
-      patchTrack(ev.id, { status: ev.status, has_file: true, error: '' });
+      emit('track', ev.id);
       if (t) { t.done = ev.downloaded; renderActivity(); }
       log(`✓ ${ev.title}`, 'ok');
       break;
-    case 'track_status':
+    case 'track_update':
+      // Полное новое состояние трека (диск, ЯМ, SoundCloud) — приходит при любом изменении.
       state.live.delete(ev.id);
-      patchTrack(ev.id, { status: ev.status, error: ev.error });
+      patchTrack(ev.id, ev.track);
+      break;
+    case 'tracks_changed':
+      // Массовое изменение (сверка, отметки, фоновая проверка) — перечитываем список.
+      api.tracks().then(r => setTracks(r.tracks)).catch(() => {});
       break;
     case 'dl_complete':
       log(`Скачано: ${ev.downloaded}` + (ev.failures ? `, не удалось: ${ev.failures}` : ''), ev.failures ? 'warn' : 'ok');
@@ -129,7 +134,7 @@ export function handleEvent(ev) {
       break;
     case 'track_uploaded':
       state.live.delete(ev.id);
-      patchTrack(ev.id, { status: 'uploaded', error: '' });
+      emit('track', ev.id);
       if (t) { t.done = (t.done || 0) + 1; renderActivity(); }
       log(`↑ ${state.byId.get(ev.id)?.title || ev.id} — в ЯМ`, 'ok');
       break;
@@ -204,7 +209,7 @@ export function resultText(name, r) {
   if (s.failures) parts.push(`не скачано: ${s.failures}`);
   if (s.upload_errors) parts.push(`ошибок загрузки: ${s.upload_errors}`);
   if (s.missing) parts.push(`не найдено в плейлисте: ${s.missing}`);
-  if (s.not_in_likes) parts.push(`пропали из лайков: ${s.not_in_likes}`);
+  if (s.unliked) parts.push(`пропали из лайков: ${s.unliked}`);
   if (r.status === 'error' && !parts.length) return s.message || 'Ошибка';
   let text = parts.join(', ');
   if (s.message && r.status !== 'cancelled') text += (text ? '. ' : '') + s.message;

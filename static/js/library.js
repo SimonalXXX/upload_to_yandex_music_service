@@ -2,10 +2,11 @@
 
 import { api } from './api.js';
 import {
-  $, artStyle, confirmDialog, count, esc, fmtAdded, highlight, hydrateIcons, icon, openMenu, toast,
+  $, artStyle, confirmDialog, count, esc, fmtAdded, fmtWhen, highlight, hydrateIcons, icon, openMenu, toast,
 } from './dom.js';
 import {
-  LIVE_LABEL, STATUS_LABEL, TASK_TITLES, busy, emit, filterById, on, scAuthor, state, visibleTracks,
+  LIVE_LABEL, TASK_TITLES, YM_CLAIMED, busy, emit, filterById, inYm, isNew, isReady, on, scAuthor, state,
+  trackBadges, visibleTracks,
 } from './store.js';
 import * as player from './player.js';
 import { refreshData, runTask } from './tasks.js';
@@ -98,11 +99,12 @@ function eqHtml() {
 
 function statusHtml(t, live) {
   if (live) return `<span class="badge st-live"><span class="mini-spin"></span>${LIVE_LABEL[live]}</span>`;
-  const title = t.status === 'unavailable' ? ` title="${esc(t.error)}"` : '';
-  const badge = `<span class="badge st-${t.status}"${title}>${STATUS_LABEL[t.status] || t.status}</span>`;
-  const err = t.error && t.status !== 'unavailable'
+  // Несколько бейджей: Яндекс Музыка, диск, SoundCloud (specs/features/track-states.md).
+  const badges = trackBadges(t, fmtWhen).map(b =>
+    `<span class="badge b-${b.cls}" title="${esc(b.title)}">${esc(b.text)}</span>`).join('');
+  const err = t.error && t.ym !== 'rejected'
     ? `<span class="err-dot" title="Последняя ошибка: ${esc(t.error)}" aria-label="Ошибка: ${esc(t.error)}"></span>` : '';
-  return badge + err;
+  return badges + err;
 }
 
 /** Точечное обновление строки без перерисовки окна. Возвращает true, если строка видна. */
@@ -150,32 +152,29 @@ function renderSelbar() {
   const sel = [...state.selected].map(id => state.byId.get(id)).filter(Boolean);
   selbar.hidden = !sel.length;
   if (!sel.length) return;
-  const by = s => sel.filter(t => t.status === s).length;
-  const withFile = sel.filter(t => t.has_file).length;
-  const inYm = by('uploaded');
-  const sentN = by('sent');
+  const n = f => sel.filter(f).length;
+  const withFile = n(t => t.has_file);
+  const dupN = n(t => YM_CLAIMED.has(t.ym));
   const parts = [
-    by('pending') && `новых ${by('pending')}`,
-    by('downloaded') && `на диске ${by('downloaded')}`,
-    sentN && `ждут ЯМ ${sentN}`,
-    inYm && `в ЯМ ${inYm}`,
-    by('unavailable') && `недоступных ${by('unavailable')}`,
-    by('not_in_likes') && `пропали из лайков ${by('not_in_likes')}`,
-  ].filter(Boolean);
+    [n(isNew), 'новых'], [withFile, 'на диске'], [n(inYm), 'в ЯМ'],
+    [n(t => t.ym === 'sent'), 'ждут ЯМ'], [n(t => t.ym === 'manual'), 'не проверены'],
+    [n(t => t.ym === 'missing'), 'нет в плейлисте'], [n(t => t.ym === 'rejected'), 'не приняты ЯМ'],
+    [n(t => t.sc === 'unavailable'), 'недоступны'],
+  ].filter(([k]) => k).map(([k, label]) => `${label} ${k}`);
   const hidden = sel.length - sel.filter(t => filterById(state.filter).test(t)).length;
   const running = busy();
   const why = running ? `Идёт «${TASK_TITLES[state.task.name] || 'задача'}» — действия станут доступны после неё` : '';
   $('#selbar-text').innerHTML = `<b>Выбрано ${sel.length}</b>${parts.length ? ` · ${parts.join(', ')}` : ''}` +
     (why ? `<span class="warn">${esc(why)}</span>` : '') +
     (hidden ? `<span class="warn">${hidden} не видно в этом разделе</span>` : '') +
-    (inYm + sentN ? `<span class="warn">${inYm + sentN === 1 ? 'Трек уже' : `${inYm + sentN} уже`} отправлен${inYm + sentN === 1 ? '' : 'ы'} в ЯМ — повторная отправка создаст дубль</span>` : '');
+    (dupN ? `<span class="warn">${dupN === 1 ? 'Трек уже' : `${dupN} уже`} в ЯМ или отправлен${dupN === 1 ? '' : 'ы'} — повторная отправка создаст дубль</span>` : '');
   const b = act => selbar.querySelector(`[data-act="${act}"]`);
   const set = (act, disabled, title = '') => { b(act).disabled = disabled; b(act).title = disabled && why ? why : title; };
   set('download', running);
   set('download-upload', running);
   set('upload', running || !withFile, withFile ? '' : 'У выбранных треков нет файлов — сначала скачайте');
-  set('mark', running || sel.length === inYm);
-  set('unmark', running || !(inYm + sentN));
+  set('mark', running || !n(t => ['none', 'sent', 'missing', 'rejected'].includes(t.ym)));
+  set('unmark', running || !n(t => t.ym !== 'none'));
 }
 
 // ── Выбор ──
@@ -311,22 +310,29 @@ export function openTrackMenu(t, at) {
     { label: 'Показать в Finder', icon: 'folder', disabled: !t.has_file, run: () => api.reveal(t.id).catch(err => toast(err.message, { kind: 'error' })) },
     'sep',
     { label: t.has_file ? 'Скачано' : 'Скачать', icon: 'download', disabled: running || t.has_file, run: () => runTask('download', [t.id], false) },
-    { label: 'Скачать и загрузить в ЯМ', icon: 'upload', disabled: running, run: () => actDownloadUpload([t]) },
-    t.status === 'uploaded' || t.status === 'sent'
-      ? { label: t.status === 'sent' ? 'Снять «Ждёт ЯМ»' : 'Снять отметку «В ЯМ»', icon: 'undo', disabled: running, run: () => actUnmark([t]) }
-      : { label: 'Уже в Яндекс Музыке', icon: 'check', disabled: running, run: () => actMark([t]) },
+    { label: t.ym === 'missing' || t.ym === 'rejected' ? 'Отправить в ЯМ заново' : 'Скачать и загрузить в ЯМ',
+      icon: 'upload', disabled: running, run: () => actDownloadUpload([t]) },
+    ...(t.ym === 'missing' || t.ym === 'rejected'
+      ? [{ label: 'Считать «В ЯМ» (сверка ошиблась)', icon: 'check', disabled: running, run: () => actMark([t]) }]
+      : t.ym === 'none'
+        ? [{ label: 'Уже в Яндекс Музыке', icon: 'check', disabled: running, run: () => actMark([t]) }]
+        : []),
+    ...(t.ym !== 'none' ? [{ label: 'Снять «В ЯМ»', icon: 'undo', disabled: running, run: () => actUnmark([t]) }] : []),
   ], at);
 }
 
 function openPickMenu(anchor) {
-  const ids = st => state.tracks.filter(t => t.status === st).map(t => t.id);
-  const missing = (state.report?.missing || []).map(t => t.id).filter(id => state.byId.has(id));
+  const pick = (label, iconName, f) => {
+    const ids = state.tracks.filter(f).map(t => t.id);
+    return { label: `${label} (${ids.length})`, icon: iconName, disabled: !ids.length, run: () => setSelection(ids) };
+  };
   openMenu([
     { label: 'Все в этом списке', icon: 'check', run: () => toggleAllVisible(true) },
     'sep',
-    { label: `Все новые (${ids('pending').length})`, icon: 'sparkle', disabled: !ids('pending').length, run: () => setSelection(ids('pending')) },
-    { label: `Все на диске (${ids('downloaded').length})`, icon: 'disk', disabled: !ids('downloaded').length, run: () => setSelection(ids('downloaded')) },
-    { label: state.report ? `Все ненайденные в ЯМ (${missing.length})` : 'Ненайденные в ЯМ — сначала сверка', icon: 'report', disabled: !missing.length, run: () => setSelection(missing) },
+    pick('Все новые', 'sparkle', isNew),
+    pick('Все готовые к отправке', 'upload', isReady),
+    pick('Все «нет в плейлисте»', 'alert', t => t.ym === 'missing'),
+    pick('Все «не приняты ЯМ»', 'x', t => t.ym === 'rejected'),
     'sep',
     { label: 'Снять выбор', icon: 'x', disabled: !state.selected.size, run: clearSelection },
   ], anchor);
@@ -350,11 +356,11 @@ function onSelbarClick(e) {
 }
 
 async function confirmDuplicates(tracks) {
-  const inYm = tracks.filter(t => t.status === 'uploaded' || t.status === 'sent').length;
-  if (!inYm) return true;
+  const dup = tracks.filter(t => YM_CLAIMED.has(t.ym)).length;
+  if (!dup) return true;
   return confirmDialog({
     title: 'Отправить повторно?',
-    text: `${count(inYm, 'трек уже отправлен', 'трека уже отправлены', 'треков уже отправлены')} в ЯМ («В ЯМ» или «Ждёт ЯМ»). Повторная отправка создаст дубли в плейлисте.`,
+    text: `${count(dup, 'трек уже', 'трека уже', 'треков уже')} в ЯМ или отправлен${dup === 1 ? '' : 'ы'} («В ЯМ», «Ждёт ЯМ», «Не проверен»). Повторная отправка создаст дубли в плейлисте.`,
     ok: 'Отправить', iconName: 'alert',
   });
 }
@@ -369,13 +375,17 @@ async function actUpload(tracks) {
 }
 
 export async function actMark(tracks) {
-  const ids = tracks.filter(t => t.status !== 'uploaded').map(t => t.id);
-  if (!ids.length) return;
-  if (ids.length > 1 && !await confirmDialog({
-    title: `Отметить ${count(ids.length, 'трек', 'трека', 'треков')} «В ЯМ»?`,
-    text: 'Они будут считаться загруженными и не попадут в следующие загрузки.',
+  const target = tracks.filter(t => ['none', 'sent', 'missing', 'rejected'].includes(t.ym));
+  if (!target.length) return;
+  const overrule = target.filter(t => t.ym === 'missing' || t.ym === 'rejected').length;
+  if ((target.length > 1 || overrule) && !await confirmDialog({
+    title: `Отметить ${count(target.length, 'трек', 'трека', 'треков')} «В ЯМ»?`,
+    text: 'Они не попадут в следующие загрузки.' + (overrule
+      ? `\n${count(overrule, 'трек', 'трека', 'треков')} сверка не нашла в плейлисте — после отметки они будут считаться «В ЯМ» по вашему подтверждению, и сверка перестанет их помечать.`
+      : '\nПри ближайшей сверке приложение проверит, что они действительно в плейлисте.'),
     ok: 'Отметить', iconName: 'check',
   })) return;
+  const ids = target.map(t => t.id);
   try {
     const r = await api.mark(ids);
     toast(`Отмечено «В ЯМ»: ${r.marked}`, { kind: 'ok' });
@@ -385,11 +395,11 @@ export async function actMark(tracks) {
 }
 
 export async function actUnmark(tracks) {
-  const ids = tracks.filter(t => t.status === 'uploaded' || t.status === 'sent').map(t => t.id);
+  const ids = tracks.filter(t => t.ym !== 'none').map(t => t.id);
   if (!ids.length) return;
   if (!await confirmDialog({
-    title: `Снять отметку «В ЯМ» с ${count(ids.length, 'трека', 'треков', 'треков')}?`,
-    text: 'Треки с файлом станут «На диске», без файла — «Новыми». Их можно будет загрузить снова.',
+    title: `Снять «В ЯМ» с ${count(ids.length, 'трека', 'треков', 'треков')}?`,
+    text: 'Треки станут «не отправлены» — их можно будет загрузить снова. Файлы на диске не меняются.',
     ok: 'Снять отметку', iconName: 'undo',
   })) return;
   try {

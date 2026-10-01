@@ -17,3 +17,4 @@ tracks.tmp
 диагностика_отчет.txt
 history.json
 *.tmp
+tracks.before-states.csv
