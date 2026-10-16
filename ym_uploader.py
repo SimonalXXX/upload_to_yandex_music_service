@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import List, Optional, Set
 
@@ -402,14 +403,86 @@ def _get_upload_target(
     )
 
 
+class _StreamedFileForm:
+    """multipart/form-data с одним файлом, отдаваемый кусками.
+
+    `requests` с files= собирает всё тело в памяти (≈ два размера файла: для сета на 200 МБ
+    пик +400 МБ). Здесь файл читается по ходу отправки, память — O(1 МБ). Заголовок поля
+    формируют те же вызовы urllib3, что и в requests, так что тело побайтно совпадает
+    (проверено тестом); boundary и Content-Length задаём сами.
+    """
+
+    CHUNK = 1 << 20
+
+    def __init__(self, field: str, filepath: Path, mime: str):
+        from urllib3.fields import RequestField
+        from urllib3.filepost import encode_multipart_formdata
+        self.path = filepath
+        self.boundary = uuid.uuid4().hex
+        rf = RequestField(name=field, data=b"", filename=filepath.name)
+        rf.make_multipart(content_type=mime)
+        body, _ = encode_multipart_formdata([rf], boundary=self.boundary)
+        tail = f"\r\n--{self.boundary}--\r\n".encode()
+        self.head, self.tail = body[:-len(tail)], tail  # у пустого поля тело = голова + хвост
+        self.size = filepath.stat().st_size
+        self.content_type = f"multipart/form-data; boundary={self.boundary}"
+        self._fh = None
+        self._pos = 0
+
+    def __len__(self) -> int:
+        return len(self.head) + self.size + len(self.tail)
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        if pos != 0 or whence != 0:
+            raise OSError("поддерживается только перемотка в начало")
+        self.close()
+        self._pos = 0
+        return 0
+
+    def read(self, n: int = -1) -> bytes:
+        total = len(self)
+        if n is None or n < 0:
+            n = total - self._pos
+        out = bytearray()
+        while n > 0 and self._pos < total:
+            hl, fl = len(self.head), self.size
+            if self._pos < hl:
+                chunk = self.head[self._pos:self._pos + n]
+            elif self._pos < hl + fl:
+                if self._fh is None:
+                    self._fh = open(self.path, "rb")
+                    self._fh.seek(self._pos - hl)
+                chunk = self._fh.read(min(n, self.CHUNK, hl + fl - self._pos))
+                if not chunk:
+                    raise OSError(f"файл изменился во время загрузки: {self.path.name}")
+            else:
+                chunk = self.tail[self._pos - hl - fl:self._pos - hl - fl + n]
+            out += chunk
+            self._pos += len(chunk)
+            n -= len(chunk)
+        return bytes(out)
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
 def _upload_file(session: requests.Session, post_target: str, filepath: Path) -> bool:
     mime = MIME_MAP.get(filepath.suffix.lower(), "audio/mpeg")
-    with open(filepath, "rb") as fh:
+    form = _StreamedFileForm("file", filepath, mime)
+    try:
         r = session.post(
             post_target,
-            files={"file": (filepath.name, fh, mime)},
+            data=form,
+            headers={"Content-Type": form.content_type},
             timeout=120,
         )
+    finally:
+        form.close()
     return r.status_code in (200, 201)
 
 

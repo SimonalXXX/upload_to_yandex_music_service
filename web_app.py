@@ -22,9 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import yaml
-import yt_dlp
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
-from yt_dlp.postprocessor.metadataparser import MetadataParserPP
 
 # ── Paths & constants ────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -58,13 +56,23 @@ AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac"}
 AUDIO_MIME = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".opus": "audio/ogg", ".flac": "audio/flac"}
 # Незавершённые скачивания yt-dlp (после отмены/сбоя) — подчищаем.
 PARTIAL_GLOBS = ("*.part", "*.part-Frag*", "*.ytdl")
-# Некоторые заливают трек с названием «… .mp3» — без этого получаются «….mp3.mp3».
-TITLE_EXT_CLEANUP_PP = {
-    "key": "MetadataParser",
-    "when": "pre_process",
-    "actions": [(MetadataParserPP.Actions.REPLACE, "title",
-                 r"(?i)\.(?:mp3|wav|flac|m4a|aiff?|ogg|opus)$", "")],
-}
+
+
+def _title_ext_cleanup_pp() -> dict:
+    """Некоторые заливают трек с названием «… .mp3» — без этого получаются «….mp3.mp3».
+
+    yt-dlp импортируется лениво (внутри задач): в простое сервер занимает ~15 МБ меньше,
+    а сбой yt-dlp после обновления не мешает открыть интерфейс."""
+    from yt_dlp.postprocessor.metadataparser import MetadataParserPP
+    return {
+        "key": "MetadataParser",
+        "when": "pre_process",
+        "actions": [(MetadataParserPP.Actions.REPLACE, "title",
+                     r"(?i)\.(?:mp3|wav|flac|m4a|aiff?|ogg|opus)$", "")],
+    }
+
+
+
 # Ошибки, после которых повторять скачивание бессмысленно → sc=unavailable.
 UNAVAILABLE_PATTERNS = (
     ("DRM protected", "Защищён DRM (SoundCloud Go+) — скачать нельзя"),
@@ -759,6 +767,7 @@ class _SilentLogger:
 
 def _fetch_likes(sc: dict, url: str, max_tracks: int) -> list[dict]:
     """Лайки SoundCloud постранично (по 200): прогресс и отмена между страницами."""
+    import yt_dlp
     global _browser_cookies_ok
     opts: dict = {"quiet": True, "no_color": True, "skip_download": True,
                   "logger": _SilentLogger()}
@@ -872,6 +881,7 @@ def _do_download(config: dict, track_ids: list | None) -> dict:
     Работает по базе, а не по результату последнего скана: после перезапуска
     приложения скачивание доступно сразу. track_ids=None — все «pending».
     """
+    import yt_dlp
     global _browser_cookies_ok
     sc = config.get("soundcloud") or {}
     out = config.get("output") or {}
@@ -972,7 +982,7 @@ def _do_download(config: dict, track_ids: list | None) -> dict:
         "sleep_requests": sc.get("sleep_requests", 1.5),
         "download_archive": str(ARCHIVE_PATH),
         "postprocessors": [
-            TITLE_EXT_CLEANUP_PP,
+            _title_ext_cleanup_pp(),
             {"key": "FFmpegExtractAudio", "preferredcodec": audio_fmt, "preferredquality": quality},
             {"key": "FFmpegMetadata"},
             {"key": "EmbedThumbnail"},
@@ -1552,6 +1562,7 @@ def _soundcloud_user(user: str) -> dict | None:
     Сначала через внутренний API экстрактора yt-dlp (даёт likes_count); если он
     поменялся — упрощённая проверка существования через страницу лайков.
     """
+    import yt_dlp
     opts = {"quiet": True, "no_warnings": True, "skip_download": True,
             "logger": _SilentLogger()}
     with yt_dlp.YoutubeDL(opts) as ydl:
