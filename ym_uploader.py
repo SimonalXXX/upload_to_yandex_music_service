@@ -471,18 +471,28 @@ class _StreamedFileForm:
             self._fh = None
 
 
+class AmbiguousUpload(requests.exceptions.RequestException):
+    """Файл (или его часть) уже ушёл на сервер, а ответ не получен или это 5xx: ЯМ мог
+    принять трек. Повторная отправка в этом случае создаёт дубль в плейлисте."""
+
+
 def _upload_file(session: requests.Session, post_target: str, filepath: Path) -> bool:
+    """True — принят (2xx); False — отклонён определённо (4xx); AmbiguousUpload — неясно
+    (оборвалось после начала отправки файла или ответ 5xx)."""
     mime = MIME_MAP.get(filepath.suffix.lower(), "audio/mpeg")
     form = _StreamedFileForm("file", filepath, mime)
     try:
-        r = session.post(
-            post_target,
-            data=form,
-            headers={"Content-Type": form.content_type},
-            timeout=120,
-        )
+        # (соединение, ожидание ответа): после отправки файла ЯМ может отвечать минутами.
+        r = session.post(post_target, data=form, headers={"Content-Type": form.content_type},
+                         timeout=(30, 600))
+    except requests.exceptions.RequestException as e:
+        if form.tell() > len(form.head):  # хоть байт файла ушёл — трек мог дойти
+            raise AmbiguousUpload(f"{type(e).__name__}: {e}") from e
+        raise
     finally:
         form.close()
+    if r.status_code >= 500:
+        raise AmbiguousUpload(f"HTTP {r.status_code}")
     return r.status_code in (200, 201)
 
 
@@ -641,7 +651,9 @@ def _upload_one(
     прийти (проверьте плейлист); исключение — загрузка не удалась.
     Удалять локальный файл безопасно только при True.
 
-    Повторная попытка — ТОЛЬКО если сам POST не прошёл (сетевой сбой/не-2xx):
+    Повторная попытка — ТОЛЬКО если файл точно не дошёл (не удалось соединиться/отправить
+    ни байта файла, или определённый отказ 4xx); оборвавшаяся отправка и 5xx — «неясно»,
+    без ретрая (см. AmbiguousUpload). Исходно — если сам POST не прошёл:
     post-target одноразовый, запрашиваем новый и повторяем. Если сервер файл
     принял (2xx), но подтверждение не получено — не ретраим (ЯМ может сменить id
     трека при обработке, и слепой повтор плодит дубли в плейлисте); подтверждаем
@@ -664,8 +676,11 @@ def _upload_one(
         )
         ugc_id = target.get("ugc-track-id")
         http_ok = False
+        ambiguous = False
         try:
             http_ok = _upload_file(session, target["post-target"], filepath)
+        except AmbiguousUpload as e:
+            last_error, ambiguous = e, True
         except requests.exceptions.RequestException as e:
             last_error = e
         if ugc_id is None and count_before is None:
@@ -674,7 +689,9 @@ def _upload_one(
         else:
             verified = _verify_uploaded(
                 session, uid, kind, ugc_id, token,
-                retries=verify_retries, delay=verify_delay,
+                # При неясном результате ждём подтверждения дольше обычного окна.
+                retries=max(verify_retries, 6) if ambiguous else verify_retries,
+                delay=max(verify_delay, 5) if ambiguous else verify_delay,
                 cancel_event=cancel_event, count_before=count_before,
             )
             if verified == "id":
@@ -683,6 +700,11 @@ def _upload_one(
                 return "grown"
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("Отменено")
+        if ambiguous:
+            # Файл ушёл, ответ не получен — ЯМ мог принять трек. Не ретраим (иначе дубли,
+            # как 16.10: по 2–3 копии); трек становится «Ждёт ЯМ» и проверится по плейлисту,
+            # а через сутки без появления — «не принят ЯМ» и отправляется вручную.
+            return "accepted"
         if http_ok:
             # Сервер ПРИНЯЛ файл (HTTP 2xx), но подтверждения в плейлисте нет:
             # обработка у ЯМ может занимать дольше окна ожидания, а id трека —
