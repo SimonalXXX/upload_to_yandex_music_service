@@ -560,6 +560,7 @@ def get_playlist_tracks(
             "title": tr.get("title", "") or "",
             "artist": artists,
             "available": tr.get("state") == "playable" or bool(tr.get("available")),
+            "dur": round((tr.get("durationMs") or 0) / 1000),
         })
     return out
 

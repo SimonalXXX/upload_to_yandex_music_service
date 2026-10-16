@@ -1179,6 +1179,14 @@ def _do_upload(config: dict, track_ids: list | None = None) -> dict:
         return {"uploaded": 0, "level": "error", "message": str(e)}
     session, uid, token, kind = ctx["session"], ctx["uid"], ctx["token"], ctx["kind"]
 
+    # Защита от дублей: список плейлиста один раз до отправки (сбой — защита пропускается).
+    try:
+        pl_before = get_playlist_tracks(session, uid, kind, token)
+    except Exception:
+        pl_before = []
+        _broadcast({"type": "log", "level": "warn",
+                    "message": "Не удалось прочитать плейлист — проверка «уже есть в плейлисте» пропущена"})
+    already = 0       # уже были в плейлисте — не отправлялись
     uploaded = 0      # подтверждены по id → «uploaded»
     sent_ids: list[str] = []  # приняты, ждут появления в плейлисте → «sent»
     upload_errors = 0
@@ -1192,6 +1200,15 @@ def _do_upload(config: dict, track_ids: list | None = None) -> dict:
         _check_cancel(_counts())
         filepath = Path(info["file"])
         name = filepath.stem
+        # Явный выбор уже «В ЯМ» треков (пользователь подтвердил дубль) не блокируем.
+        if (info.get("ym") or "none") not in ("confirmed", "pinned") and _already_in_playlist(info, pl_before):
+            already += 1
+            # pinned, а не confirmed: найден по длительности и названию (точнее имён, которыми
+            # сверяет _verify_ym) — иначе та же проверка, не найдя его по имени, назвала бы его «нет в плейлисте».
+            _track_update(sc_id, ym="pinned", ym_checked_at=str(int(time.time())), error="", sent_at="")
+            _broadcast({"type": "log", "id": sc_id, "level": "info",
+                        "message": f"{name}: уже есть в плейлисте — не отправляю, отмечен «В ЯМ»"})
+            continue
         _broadcast({
             "type": "uploading",
             "id": sc_id,
@@ -1247,9 +1264,40 @@ def _do_upload(config: dict, track_ids: list | None = None) -> dict:
     sent = len(sent_ids) - confirmed_late
 
     result = {"uploaded": uploaded, "sent": sent, "upload_errors": upload_errors}
+    if already:
+        result["already"] = already
     if upload_errors:
         result["level"] = "warn"
     return result
+
+
+def _file_duration(path: str | None) -> int | None:
+    try:
+        import mutagen
+        return round(mutagen.File(path).info.length)
+    except Exception:
+        return None
+
+
+def _already_in_playlist(info: dict, pl_tracks: list[dict], tol: int = 3) -> bool:
+    """Защита от дублей: есть ли уже в плейлисте этот трек — исполнитель + название + длительность
+    (±tol с). Совпадение одного названия не считаем: это разные треки с одинаковым именем.
+    Нет исполнителя в базе (старые треки) — сверяем название и длительность."""
+    dur = _file_duration(info.get("file"))
+    title, artist = _norm(info.get("title")), _norm(info.get("artist"))
+    if not title or dur is None:
+        return False
+    for t in pl_tracks:
+        pl_full = _norm(f"{t['title']}")
+        if not t.get("dur") or abs(t["dur"] - dur) > tol:
+            continue
+        if _norm(t["title"]) == title and (not artist or _norm(t["artist"]) == artist):
+            return True
+        # ЯМ часто склеивает «Исполнитель - Название» из имени файла в title или меняет исполнителя:
+        # при длительности ±2 с хватает, чтобы одно название содержало другое (от 6 символов).
+        if abs(t["dur"] - dur) <= 2 and len(title) >= 6 and (title in pl_full or (len(pl_full) >= 6 and pl_full in title)):
+            return True
+    return False
 
 
 def _pl_matcher(pl_tracks: list[dict]):
