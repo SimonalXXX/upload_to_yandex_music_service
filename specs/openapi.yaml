@@ -18,7 +18,10 @@ info:
     `has_file` (диск), `ym` (+ `ym_checked_at`, `sent_at`), `liked` + `sc` (+ `sc_reason`); статистика
     по признакам; сверка записывает результат в `ym` и отдаёт `missing`/`rejected`/`sent_waiting` и
     `changes`. Миграция: клиент один — встроенный интерфейс, обновлён в том же релизе.
-  version: "3.0.0"
+
+    **3.1.0** (`specs/features/playlist-dedupe.md`): `GET /api/playlist/duplicates` (предпросмотр групп
+    дублей) и `POST /api/playlist/dedupe` (удаление лишних копий в выбранных группах).
+  version: "3.1.0"
 
 servers:
   - url: http://127.0.0.1:5555
@@ -485,6 +488,83 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /api/playlist/duplicates:
+    get:
+      summary: Группы дублей плейлиста с предпросмотром (ничего не меняет)
+      description: |
+        Дубль — одинаковые исполнитель + название (с версией) + длительность (±1 с). В группе
+        оставляется самая ранняя копия (`keep`), остальные (`remove`) — кандидаты на удаление.
+      operationId: apiPlaylistDuplicates
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  playlist: { type: object }
+                  total_remove: { type: integer }
+                  groups:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DuplicateGroup"
+        "400": { $ref: "#/components/responses/BadRequestError" }
+        "502":
+          description: Нет авторизации ЯМ / ошибка API
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/playlist/dedupe:
+    post:
+      summary: Удалить лишние копии в выбранных группах дублей
+      description: |
+        Необратимо. Плейлист читается заново, группы пересчитываются; сохраняется резервная копия
+        (`backups/playlist-<время>.json`); удаление — одна операция `change` с ревизией; результат
+        проверяется перечитыванием. Без `keep_ids` не работает.
+      operationId: apiPlaylistDedupe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keep_ids]
+              properties:
+                keep_ids:
+                  type: array
+                  description: id оставляемых копий — по ним выбираются группы
+                  items: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, description: Проверка результата сошлась }
+                  removed: { type: integer }
+                  groups: { type: integer }
+                  before: { type: integer }
+                  after: { type: integer }
+                  kept_ok: { type: boolean }
+                  gone_ok: { type: boolean }
+                  backup: { type: string }
+        "400": { $ref: "#/components/responses/BadRequestError" }
+        "409":
+          description: Выполняется задача или выбранных групп уже нет
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: ЯМ отклонил изменение или недоступен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /api/history:
     get:
       summary: История операций (последние 50, новые сверху), без журналов
@@ -559,6 +639,12 @@ components:
         type: string
 
   responses:
+    BadRequestError:
+      description: Неверный запрос
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     Started:
       description: Задача запущена
       content:
@@ -768,6 +854,26 @@ components:
             properties:
               artist: { type: string }
               title: { type: string }
+
+    DuplicateGroup:
+      type: object
+      properties:
+        artist: { type: string }
+        title: { type: string }
+        version: { type: string }
+        dur: { type: integer }
+        keep: { $ref: "#/components/schemas/DuplicateCopy" }
+        remove:
+          type: array
+          items: { $ref: "#/components/schemas/DuplicateCopy" }
+
+    DuplicateCopy:
+      type: object
+      properties:
+        id: { type: string }
+        pos: { type: integer, description: Позиция в плейлисте }
+        ts: { type: string, description: Время добавления }
+        dur: { type: integer }
 
     HistoryRecordBase:
       type: object

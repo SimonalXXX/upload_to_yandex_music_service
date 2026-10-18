@@ -24,6 +24,9 @@ const LISTS = {
 const picked = { missing: new Set(), rejected: new Set() };
 let checking = false;
 let root;
+let dupes = null;          // предпросмотр: {groups, total_remove} из /api/playlist/duplicates
+let dupBusy = false;
+const dupPicked = new Set(); // id оставляемых копий выбранных групп
 
 export function init() {
   root = $('#view-report');
@@ -134,11 +137,7 @@ function render() {
     <div class="group"><ul class="plain-list">${sent.map(t => `<li><div class="grow"><div>${esc(t.title)}</div>
       <div class="sub">${esc(t.artist || '—')}${t.sent_at ? ` · отправлен ${esc(fmtWhen(t.sent_at))}` : ''}</div></div></li>`).join('')}</ul></div>` : ''}
 
-    <h2>Дубли в плейлисте · ${r.duplicates_list.length}</h2>
-    <p class="lead">Удалить лишние копии можно в самой Яндекс Музыке. Здесь — только список.</p>
-    <div class="group"><ul class="plain-list">${r.duplicates_list.length
-      ? r.duplicates_list.map(d => `<li><div class="grow"><div>${esc(d.title)}</div><div class="sub">${esc(d.artist)}</div></div><span class="num">× ${d.count}</span></li>`).join('')
-      : `<li class="muted">${icon('check')} Дублей нет</li>`}</ul></div>
+    ${dupHtml(r, running)}
 
     <h2>В обработке · ${r.processing_list.length}</h2>
     <div class="group"><ul class="plain-list">${r.processing_list.length
@@ -147,13 +146,76 @@ function render() {
   </div>`;
 }
 
+function dupHtml(r, running) {
+  const head = `<h2>Дубли в плейлисте · ${r.duplicates_list.length}</h2>`;
+  if (!dupes) {
+    return `${head}<p class="lead">Найдём лишние копии и покажем, какая останется. Ничего не удаляется, пока вы не подтвердите.</p>
+      <div class="group"><ul class="plain-list">${r.duplicates_list.length
+        ? r.duplicates_list.map(d => `<li><div class="grow"><div>${esc(d.title)}</div><div class="sub">${esc(d.artist)}</div></div><span class="num">× ${d.count}</span></li>`).join('')
+        : `<li class="muted">${icon('check')} Дублей нет</li>`}</ul></div>
+      ${r.duplicates_list.length ? `<p><button class="btn" data-act="dup-find" type="button" ${dupBusy ? 'disabled' : ''}>${dupBusy ? '<span class="mini-spin"></span>Ищу…' : 'Найти лишние копии'}</button></p>` : ''}`;
+  }
+  const g = dupes.groups;
+  const n = [...dupPicked].reduce((a, id) => a + (g.find(x => x.keep.id === id)?.remove.length || 0), 0);
+  return `${head}<p class="lead">В каждой группе остаётся самая ранняя копия, остальные удаляются из плейлиста. <b>Это необратимо</b> — резервная копия плейлиста сохраняется в папку backups/. Два разных трека с одинаковым названием и длительностью попадут сюда же — снимите галочку.</p>
+    <div class="group">
+      <div class="group-tools">
+        <label><input type="checkbox" data-dup-all ${dupPicked.size && dupPicked.size === g.length ? 'checked' : ''}> Выбрать все</label>
+        <span class="grow muted">${dupPicked.size ? `групп ${dupPicked.size} · удалится копий: ${n}` : `групп: ${g.length}`}</span>
+        <button class="btn" data-act="dup-refresh" type="button" ${dupBusy ? 'disabled' : ''}>Обновить</button>
+        <button class="btn danger" data-act="dup-delete" type="button" ${dupPicked.size && !running && !dupBusy ? '' : 'disabled'}>${dupBusy ? '<span class="mini-spin"></span>Удаляю…' : `Удалить лишние копии (${n})`}</button>
+      </div>
+      <ul class="plain-list">${g.length ? g.map(x => `<li>
+        <input type="checkbox" data-dup="${esc(x.keep.id)}" ${dupPicked.has(x.keep.id) ? 'checked' : ''} aria-label="Выбрать группу">
+        <div class="grow"><div>${esc(x.title)} ${esc(x.version)}</div>
+          <div class="sub">${esc(x.artist)} · ${x.dur} с · копий ${x.remove.length + 1}: останется добавленная ${esc((x.keep.ts || '').slice(0, 16).replace('T', ' '))}, удалится ${x.remove.length}</div></div>
+      </li>`).join('') : `<li class="muted">${icon('check')} Дублей нет</li>`}</ul>
+    </div>`;
+}
+
+async function dupFind() {
+  dupBusy = true; render();
+  try {
+    dupes = await api.duplicates();
+    for (const id of [...dupPicked]) if (!dupes.groups.some(x => x.keep.id === id)) dupPicked.delete(id);
+  } catch (err) { toast(err.message, { kind: 'error', title: 'Поиск дублей' }); }
+  dupBusy = false; render();
+}
+
+async function dupDelete() {
+  const g = dupes.groups.filter(x => dupPicked.has(x.keep.id));
+  const n = g.reduce((a, x) => a + x.remove.length, 0);
+  const ok = await confirmDialog({
+    title: `Удалить ${count(n, 'копию', 'копии', 'копий')} из плейлиста?`,
+    text: `Групп: ${g.length}. В каждой останется одна самая ранняя копия. Действие необратимо, резервная копия плейлиста сохранится в папке backups/.`,
+    ok: 'Удалить', danger: true, iconName: 'alert',
+  });
+  if (!ok) return;
+  dupBusy = true; render();
+  try {
+    const r = await api.dedupe(g.map(x => x.keep.id));
+    toast(r.ok ? `Удалено копий: ${r.removed}. В плейлисте было ${r.before}, стало ${r.after}.`
+      : `Удалено ${r.removed}, но проверка не сошлась (было ${r.before}, стало ${r.after}) — проверьте плейлист.`,
+      { kind: r.ok ? 'ok' : 'warn', title: 'Дубли' });
+    dupPicked.clear();
+    await check();   // свежая сверка и список
+    dupes = null;
+  } catch (err) { toast(err.message, { kind: 'error', title: 'Не удалось удалить' }); }
+  dupBusy = false; render();
+}
+
 function stat(n, label, bad = 0) {
   return `<div class="stat${bad ? ' bad' : ''}"><b>${n}</b><span>${esc(label)}</span></div>`;
 }
 
 function onChange(e) {
   const cb = e.target;
-  if (cb.dataset.all) {
+  if (cb.dataset.dupAll !== undefined) {
+    dupPicked.clear();
+    if (cb.checked) dupes.groups.forEach(x => dupPicked.add(x.keep.id));
+  } else if (cb.dataset.dup) {
+    cb.checked ? dupPicked.add(cb.dataset.dup) : dupPicked.delete(cb.dataset.dup);
+  } else if (cb.dataset.all) {
     const key = cb.dataset.all;
     picked[key].clear();
     if (cb.checked) byYm(key).forEach(t => picked[key].add(t.id));
@@ -171,6 +233,8 @@ async function onClick(e) {
   const key = b.dataset.list;
   const tracks = key ? [...picked[key]].map(id => state.byId.get(id)).filter(Boolean) : [];
   if (act === 'check') check();
+  else if (act === 'dup-find' || act === 'dup-refresh') dupFind();
+  else if (act === 'dup-delete') dupDelete();
   else if (act === 'settings') location.hash = '#settings';
   else if (act === 'show') { setSelection(tracks.map(t => t.id)); location.hash = `#library/${LISTS[key].filter}`; }
   else if (act === 'pin') { await actMark(tracks); picked[key].clear(); render(); }

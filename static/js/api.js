@@ -39,6 +39,8 @@ export const api = {
   openFolder: () => req('POST', '/api/open-folder'),
   lastReport: () => req('GET', '/api/check-playlist'),
   checkPlaylist: () => req('POST', '/api/check-playlist'),
+  duplicates: () => req('GET', '/api/playlist/duplicates'),
+  dedupe: keep_ids => req('POST', '/api/playlist/dedupe', { keep_ids }),
   history: () => req('GET', '/api/history'),
   historyItem: id => req('GET', `/api/history/${idPath(id)}`),
 };

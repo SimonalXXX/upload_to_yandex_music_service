@@ -534,6 +534,7 @@ def get_playlist_info(
         "title": pl.get("title") or "",
         "track_count": count,
         "owner": (pl.get("owner") or {}).get("login") or "",
+        "revision": pl.get("revision"),
     }
 
 
@@ -561,8 +562,70 @@ def get_playlist_tracks(
             "artist": artists,
             "available": tr.get("state") == "playable" or bool(tr.get("available")),
             "dur": round((tr.get("durationMs") or 0) / 1000),
+            "version": tr.get("version", "") or "",
+            "ts": item.get("timestamp") or "",
         })
     return out
+
+
+def _norm_key(s: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", (s or "").lower().replace("ё", "е")).split())
+
+
+def find_duplicate_groups(tracks: List[dict]) -> List[dict]:
+    """Группы дублей плейлиста: исполнитель + название (с версией) + длительность (±1 с).
+
+    Оставляем самую раннюю копию (по времени добавления, затем по позиции); остальные — на удаление.
+    tracks — результат get_playlist_tracks (порядок = позиции в плейлисте).
+    """
+    buckets: dict = {}
+    for pos, t in enumerate(tracks):
+        key = (_norm_key(t.get("artist")), _norm_key(f"{t.get('title', '')} {t.get('version', '')}"))
+        if key == ("", ""):
+            continue
+        buckets.setdefault(key, []).append({**t, "pos": pos})
+    groups = []
+    for (artist, title), items in buckets.items():
+        items.sort(key=lambda x: x["dur"])
+        # разбиваем по длительности: соседние отличаются не более чем на 1 с
+        cluster = [items[0]]
+        clusters = [cluster]
+        for it in items[1:]:
+            if it["dur"] - cluster[-1]["dur"] <= 1:
+                cluster.append(it)
+            else:
+                cluster = [it]
+                clusters.append(cluster)
+        for c in clusters:
+            if len(c) < 2:
+                continue
+            c = sorted(c, key=lambda x: (x.get("ts") or "9999", x["pos"]))
+            keep, rest = c[0], c[1:]
+            groups.append({"artist": keep["artist"], "title": keep["title"], "version": keep.get("version", ""),
+                           "dur": keep["dur"], "keep": keep, "remove": rest})
+    groups.sort(key=lambda g: g["keep"]["pos"])
+    return groups
+
+
+def delete_playlist_positions(session: requests.Session, uid: int, kind: str, token: str,
+                              revision: int, positions: List[int]) -> dict:
+    """Удаляет треки плейлиста по позициям (одна операция change с ревизией).
+
+    Операции diff применяются по очереди, поэтому идём от больших позиций к меньшим —
+    предыдущие индексы не сдвигаются. Неверная ревизия → ЯМ отвечает ошибкой (никаких изменений).
+    """
+    import json as _json
+    diff = [{"op": "delete", "from": p, "to": p + 1} for p in sorted(set(positions), reverse=True)]
+    r = session.post(
+        f"{API_BASE}/users/{uid}/playlists/{kind}/change",
+        data={"kind": str(kind), "revision": str(revision), "diff": _json.dumps(diff)},
+        headers=_api_headers(token, uid),
+        timeout=60,
+    )
+    if not r.ok:
+        raise RuntimeError(f"ЯМ отклонил изменение плейлиста: HTTP {r.status_code} {_parse_api_error(r)}")
+    body = r.json()
+    return body.get("result", body) if isinstance(body, dict) else {}
 
 
 def _verify_uploaded(

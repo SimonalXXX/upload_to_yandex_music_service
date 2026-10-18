@@ -18,3 +18,4 @@ tracks.tmp
 history.json
 *.tmp
 tracks.before-states.csv
+backups/

@@ -1892,6 +1892,82 @@ def api_check_playlist():
         return jsonify({"error": str(e)}), 502
 
 
+def _dup_view(g: dict) -> dict:
+    slim = lambda t: {"id": t["id"], "pos": t["pos"], "ts": t.get("ts", ""), "dur": t["dur"]}
+    return {"artist": g["artist"], "title": g["title"], "version": g.get("version", ""), "dur": g["dur"],
+            "keep": slim(g["keep"]), "remove": [slim(t) for t in g["remove"]]}
+
+
+@app.route("/api/playlist/duplicates")
+def api_playlist_duplicates():
+    """Группы дублей плейлиста с предпросмотром (что остаётся, что удалится). Ничего не меняет."""
+    from ym_uploader import find_duplicate_groups, get_playlist_info, get_playlist_tracks
+    cfg = _load_config()
+    url = (cfg.get("yandex_music") or {}).get("playlist_url", "")
+    if not url:
+        return jsonify({"error": "URL плейлиста не задан"}), 400
+    try:
+        ctx = _ym_connect(url)
+        info = get_playlist_info(ctx["session"], ctx["uid"], ctx["kind"], ctx["token"])
+        groups = find_duplicate_groups(get_playlist_tracks(ctx["session"], ctx["uid"], ctx["kind"], ctx["token"]))
+    except TaskError as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        return jsonify({"error": f"Ошибка API Яндекс Музыки: {e!s:.200}"}), 502
+    return jsonify({"playlist": info, "groups": [_dup_view(g) for g in groups],
+                    "total_remove": sum(len(g["remove"]) for g in groups)})
+
+
+@app.route("/api/playlist/dedupe", methods=["POST"])
+def api_playlist_dedupe():
+    """Удаляет лишние копии в выбранных группах дублей (keep_ids — id оставляемых копий).
+
+    Плейлист читается заново; перед удалением — резервная копия в backups/; после — проверка."""
+    from ym_uploader import (delete_playlist_positions, find_duplicate_groups, get_playlist_info,
+                             get_playlist_tracks)
+    data = request.get_json(silent=True) or {}
+    keep_ids = data.get("keep_ids")
+    if not isinstance(keep_ids, list) or not keep_ids:
+        return jsonify({"error": "Укажите keep_ids — группы, в которых удалить лишние копии"}), 400
+    keep_ids = {str(k) for k in keep_ids}
+    cfg = _load_config()
+    url = (cfg.get("yandex_music") or {}).get("playlist_url", "")
+    if not url:
+        return jsonify({"error": "URL плейлиста не задан"}), 400
+    with _task_lock:
+        if _active_task:
+            return jsonify({"error": "Дождитесь завершения текущей задачи"}), 409
+        try:
+            ctx = _ym_connect(url)
+            sess, uid, kind, token = ctx["session"], ctx["uid"], ctx["kind"], ctx["token"]
+            info = get_playlist_info(sess, uid, kind, token)
+            tracks = get_playlist_tracks(sess, uid, kind, token)
+            groups = [g for g in find_duplicate_groups(tracks) if g["keep"]["id"] in keep_ids]
+            if not groups:
+                return jsonify({"error": "Выбранных групп дублей больше нет в плейлисте — обновите список"}), 409
+            positions = [t["pos"] for g in groups for t in g["remove"]]
+            backup_dir = BASE_DIR / "backups"
+            backup_dir.mkdir(exist_ok=True)
+            backup = backup_dir / f"playlist-{time.strftime('%Y%m%d-%H%M%S')}.json"
+            backup.write_text(json.dumps({"playlist": info, "tracks": tracks, "removing": positions},
+                                         ensure_ascii=False), encoding="utf-8")
+            delete_playlist_positions(sess, uid, kind, token, info["revision"], positions)
+            after = get_playlist_tracks(sess, uid, kind, token)
+        except TaskError as e:
+            return jsonify({"error": str(e)}), 502
+        except Exception as e:
+            return jsonify({"error": f"Не удалось удалить: {e!s:.250}"}), 502
+    after_ids = {t["id"] for t in after}
+    removed_ids = {t["id"] for g in groups for t in g["remove"]}
+    kept_ok = all(g["keep"]["id"] in after_ids for g in groups)
+    gone_ok = not (removed_ids & after_ids)
+    ok = kept_ok and gone_ok and len(tracks) - len(after) == len(positions)
+    _broadcast({"type": "log", "level": "info" if ok else "warn",
+                "message": f"Удаление дублей: было {len(tracks)}, стало {len(after)} (ожидалось {len(tracks) - len(positions)})"})
+    return jsonify({"ok": ok, "removed": len(positions), "groups": len(groups), "before": len(tracks),
+                    "after": len(after), "kept_ok": kept_ok, "gone_ok": gone_ok, "backup": backup.name})
+
+
 @app.route("/api/history")
 def api_history():
     items = [{k: v for k, v in rec.items() if k != "events"} | {"events_count": len(rec.get("events", []))}
